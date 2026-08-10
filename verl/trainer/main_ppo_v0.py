@@ -21,9 +21,14 @@ import socket
 import ray
 from omegaconf import OmegaConf
 
-from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler, need_critic, need_reference_policy
+from verl.trainer.ppo.utils import (
+    create_rl_dataset,
+    create_rl_sampler,
+    need_critic,
+    need_reference_policy,
+    need_teacher_policy,
+)
 from verl.utils.config import validate_config
 
 
@@ -85,7 +90,7 @@ class BaseTaskRunner:
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if need_teacher_policy(config):
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:
@@ -115,7 +120,7 @@ class BaseTaskRunner:
         """Add teacher model worker if enabled."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        if is_distillation_enabled(config.get("distillation")):
+        if need_teacher_policy(config):
             # we do not use teacher model workers, so we only register teacher model in resource pool
             # without registering a teacher model worker in role-worker mapping
             self.mapping[Role.TeacherModel] = "teacher_pool"

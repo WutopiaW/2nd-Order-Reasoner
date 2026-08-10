@@ -225,6 +225,48 @@ class LLMServerClient:
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
 
+    @staticmethod
+    def _finalize_output(output: TokenOutput) -> TokenOutput:
+        global_steps = output.extra_fields.get("global_steps")
+        output.extra_fields.setdefault("min_global_steps", global_steps)
+        output.extra_fields.setdefault("max_global_steps", global_steps)
+        return output
+
+    async def _generate_on_server(
+        self,
+        server: ray.actor.ActorHandle,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> TokenOutput:
+        """Issue one backend request to an already selected server."""
+        multimodal_kwargs = {}
+        if audio_data is not None:
+            multimodal_kwargs["audio_data"] = audio_data
+        if mm_processor_kwargs:
+            multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        # priority is only supported by vLLM rollout server.
+        priority = kwargs.pop("priority", 0)
+        priority_kwargs = (
+            {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
+        )
+        output: TokenOutput = await server.generate.remote(
+            request_id=uuid4().hex,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            video_data=video_data,
+            **multimodal_kwargs,
+            **priority_kwargs,
+            **kwargs,
+        )
+        return self._finalize_output(output)
+
     @rollout_trace_op
     async def generate(
         self,
@@ -250,30 +292,44 @@ class LLMServerClient:
         """
         server_id, server = await self._acquire_server(request_id)
         try:
-            multimodal_kwargs = {}
-            if audio_data is not None:
-                multimodal_kwargs["audio_data"] = audio_data
-            if mm_processor_kwargs:
-                multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
-            # priority is only supported by vLLM rollout server.
-            priority = kwargs.pop("priority", 0)
-            priority_kwargs = (
-                {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
-            )
-            output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+            return await self._generate_on_server(
+                server,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
-                **multimodal_kwargs,
-                **priority_kwargs,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
                 **kwargs,
             )
-            global_steps = output.extra_fields.get("global_steps")
-            output.extra_fields.setdefault("min_global_steps", global_steps)
-            output.extra_fields.setdefault("max_global_steps", global_steps)
-            return output
+        finally:
+            self._release_server(server_id)
+
+    @rollout_trace_op
+    async def generate_group(self, request_id: str, requests: list[dict[str, Any]]) -> list[TokenOutput]:
+        """Generate a synchronized request group on one rollout server.
+
+        SGLang receives the group through its native batch API so scheduler-local
+        protocols such as mix-sglang PDS register every member atomically. Other
+        backends dispatch the requests concurrently to the same selected actor.
+        """
+        if not requests:
+            raise ValueError("generate_group requires at least one request.")
+
+        server_id, server = await self._acquire_server(request_id)
+        try:
+            rollout_config = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+            if getattr(rollout_config, "name", None) == "sglang":
+                backend_requests = []
+                for request in requests:
+                    backend_request = dict(request)
+                    backend_request.pop("priority", None)
+                    backend_request["request_id"] = uuid4().hex
+                    backend_requests.append(backend_request)
+                outputs = await server.generate_group.remote(requests=backend_requests)
+                return [self._finalize_output(output) for output in outputs]
+            tasks = [self._generate_on_server(server, **dict(request)) for request in requests]
+            return list(await asyncio.gather(*tasks))
         finally:
             self._release_server(server_id)
 

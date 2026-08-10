@@ -135,6 +135,48 @@ def test_padding_conversion_without_log_probs():
     assert "ref_log_prob" not in data_converted
 
 
+def test_padding_conversion_preserves_rollout_source_and_fused_topk_distributions():
+    batch_size, max_seq_len, max_response_len, topk = 2, 5, 2, 3
+    attention_mask = torch.tensor(
+        [
+            [0, 1, 1, 1, 1],
+            [0, 0, 1, 1, 1],
+        ]
+    )
+    base_ids = torch.arange(batch_size * max_seq_len * topk, dtype=torch.int32).reshape(
+        batch_size,
+        max_seq_len,
+        topk,
+    )
+    base_logprobs = -base_ids.float()
+    data = TensorDict(
+        {
+            "input_ids": torch.arange(batch_size * max_seq_len).reshape(batch_size, max_seq_len),
+            "attention_mask": attention_mask,
+            "response_mask": torch.ones(batch_size, max_response_len),
+            "position_ids": torch.arange(max_seq_len).expand(batch_size, -1),
+            "teacher_ids": base_ids,
+            "teacher_logprobs": base_logprobs,
+            "source_topk_ids": base_ids + 100,
+            "source_topk_logprobs": base_logprobs - 100,
+            "fused_topk_ids": base_ids + 200,
+            "fused_topk_logprobs": base_logprobs - 200,
+        },
+        batch_size=[batch_size],
+    )
+
+    converted = left_right_2_no_padding(data)
+
+    for prefix in ("teacher", "source_topk", "fused_topk"):
+        assert converted[f"{prefix}_ids"].is_nested
+        assert converted[f"{prefix}_logprobs"].is_nested
+        assert converted[f"{prefix}_ids"][0].shape == (4, topk)
+        assert converted[f"{prefix}_ids"][1].shape == (3, topk)
+
+    torch.testing.assert_close(converted["source_topk_ids"][0], (base_ids + 100)[0, 1:])
+    torch.testing.assert_close(converted["fused_topk_logprobs"][1], (base_logprobs - 200)[1, 2:])
+
+
 def test_padding_roundtrip():
     """Test that converting from padding to nested and back preserves values in the response region"""
     batch_size = 2

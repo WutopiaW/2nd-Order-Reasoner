@@ -49,6 +49,12 @@ from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.logprob_protocol import (
+    PDS_PROBABILITY_FIELDS,
+    extract_pds_probability_fields,
+    extract_token_logprobs,
+    extract_topk_logprobs,
+)
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
@@ -58,6 +64,17 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+
+@dataclasses.dataclass(frozen=True)
+class _GenerationRequestContext:
+    request_id: str
+    prompt_ids: list[int]
+    return_logprob: bool
+    top_logprobs_num: int | None
+    prompt_logprobs: int | None
+    pds_return_prob_trajectory: bool
+    pds_top_k: int | None
 
 
 def _extract_prompt_logprobs_sglang(
@@ -524,6 +541,268 @@ class SGLangHttpServer:
         await self.tokenizer_manager.resume_memory_occupation(obj, None)
         await self.tokenizer_manager.flush_cache()
 
+    def _prepare_generate_request(
+        self,
+        *,
+        prompt_ids: list[int] | torch.Tensor,
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_port: Optional[int] = None,
+        bootstrap_room: Optional[int] = None,
+    ) -> tuple[dict[str, Any], _GenerationRequestContext]:
+        """Normalize one request without dispatching it to the scheduler."""
+        del video_data  # TODO: support video input for the SGLang backend.
+        prompt_ids = prompt_ids.tolist() if isinstance(prompt_ids, torch.Tensor) else list(prompt_ids)
+        sampling_params = dict(sampling_params)
+        max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
+        if max_possible_tokens < 0:
+            raise ValueError(
+                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
+                f"({self.config.max_model_len})."
+            )
+
+        if "max_new_tokens" in sampling_params:
+            max_new_tokens = sampling_params.pop("max_new_tokens")
+        elif "max_tokens" in sampling_params:
+            max_new_tokens = sampling_params.pop("max_tokens")
+        else:
+            max_new_tokens = min(
+                self.config.response_length,
+                self.config.prompt_length + self.config.response_length - len(prompt_ids),
+            )
+        sampling_params["max_new_tokens"] = max(0, min(max_new_tokens, max_possible_tokens))
+
+        return_logprob = bool(sampling_params.pop("logprobs", False))
+        top_logprobs_num = sampling_params.pop("top_logprobs_num", None)
+        if top_logprobs_num is not None:
+            top_logprobs_num = int(top_logprobs_num)
+            if top_logprobs_num <= 0:
+                raise ValueError(f"top_logprobs_num must be positive, got {top_logprobs_num}.")
+            return_logprob = True
+
+        prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
+        if prompt_logprobs is not None:
+            prompt_logprobs = int(prompt_logprobs)
+            return_logprob = True
+
+        custom_params = sampling_params.get("custom_params")
+        pds_return_prob_trajectory = False
+        pds_top_k = None
+        if isinstance(custom_params, dict):
+            pds_return_prob_trajectory = bool(custom_params.get("__pds_return_prob_trajectory", False))
+            if "__pds_return_top_k" in custom_params:
+                pds_top_k = custom_params["__pds_return_top_k"]
+                if isinstance(pds_top_k, bool) or not isinstance(pds_top_k, int) or pds_top_k <= 0:
+                    raise ValueError(f"__pds_return_top_k must be a positive integer, got {pds_top_k!r}.")
+
+        request: dict[str, Any] = {
+            "rid": request_id,
+            "input_ids": prompt_ids,
+            "sampling_params": sampling_params,
+            "return_logprob": return_logprob,
+            "logprob_start_len": -1,
+            "top_logprobs_num": top_logprobs_num or 0,
+            "image_data": image_data,
+        }
+        if prompt_logprobs is not None:
+            request["logprob_start_len"] = 0
+            if prompt_logprobs > 0:
+                if top_logprobs_num is not None and top_logprobs_num != prompt_logprobs:
+                    raise ValueError(
+                        "SGLang uses one top_logprobs_num for input and output logprobs, "
+                        f"but got prompt_logprobs={prompt_logprobs} and top_logprobs_num={top_logprobs_num}."
+                    )
+                request["top_logprobs_num"] = prompt_logprobs
+
+        if self.config.enable_rollout_routing_replay:
+            request["return_routed_experts"] = True
+        if bootstrap_room is not None:
+            request.update(
+                {
+                    "bootstrap_host": bootstrap_host,
+                    "bootstrap_port": bootstrap_port,
+                    "bootstrap_room": bootstrap_room,
+                }
+            )
+        if self.model_config.lora_rank > 0:
+            request["lora_path"] = SGLANG_LORA_NAME
+
+        context = _GenerationRequestContext(
+            request_id=request_id,
+            prompt_ids=prompt_ids,
+            return_logprob=return_logprob,
+            top_logprobs_num=top_logprobs_num,
+            prompt_logprobs=prompt_logprobs,
+            pds_return_prob_trajectory=pds_return_prob_trajectory,
+            pds_top_k=pds_top_k,
+        )
+        return request, context
+
+    def _convert_generate_output(
+        self,
+        output: dict[str, Any],
+        context: _GenerationRequestContext,
+        *,
+        require_pds_fields: bool = True,
+    ) -> TokenOutput:
+        meta_info = output.get("meta_info", {})
+        has_pds_fields = any(meta_info.get(field) is not None for field in PDS_PROBABILITY_FIELDS)
+        missing_selected_probs = context.pds_return_prob_trajectory and not all(
+            meta_info.get(field) is not None
+            for field in ("pds_source_token_probs", "pds_fused_token_probs")
+        )
+        missing_top_k = context.pds_top_k is not None and not all(
+            meta_info.get(field) is not None for field in ("pds_source_top_k", "pds_fused_top_k")
+        )
+        if require_pds_fields and (missing_selected_probs or missing_top_k):
+            raise ValueError(
+                "mix-sglang did not return the requested PDS probability fields. "
+                "Install a build with PDS probability trajectories and top-k support."
+            )
+
+        finish_reason = meta_info.get("finish_reason")
+        finish_reason = finish_reason["type"] if finish_reason else None
+        token_ids = list(output.get("output_ids", []))
+        log_probs = None
+        if context.return_logprob and not has_pds_fields:
+            output_token_logprobs = meta_info.get("output_token_logprobs") or []
+            if output_token_logprobs and len(output_token_logprobs) == len(token_ids):
+                log_probs, logprob_token_ids = extract_token_logprobs(
+                    output_token_logprobs,
+                    expected_length=len(token_ids),
+                    field_name="output_token_logprobs",
+                )
+                if logprob_token_ids != token_ids:
+                    raise ValueError(
+                        "output_token_logprobs token ids do not match output_ids: "
+                        f"{logprob_token_ids=} != {token_ids=}."
+                    )
+            else:
+                if len(output_token_logprobs) != len(token_ids):
+                    logger.error(
+                        f"output_token_logprobs length ({len(output_token_logprobs)}) != "
+                        f"output_ids length ({len(token_ids)}) for request {context.request_id}"
+                    )
+                token_ids = []
+                log_probs = []
+
+        routed_experts = None
+        if self.config.enable_rollout_routing_replay:
+            if self.config.skip_tokenizer_init:
+                captured = meta_info.get("routed_experts")
+                routed_experts = captured.numpy() if captured is not None else None
+            else:
+                from sglang.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info
+
+                hf_config = self.model_config.hf_config
+                if not hasattr(hf_config, "num_hidden_layers") or not hasattr(hf_config, "num_experts_per_tok"):
+                    raise AttributeError(
+                        "enable_rollout_routing_replay is set, but hf_config is missing "
+                        "'num_hidden_layers' or 'num_experts_per_tok'."
+                    )
+                routed_experts = extract_routed_experts_from_meta_info(output).reshape(
+                    -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
+                )
+
+        extra_fields = {"global_steps": self.global_steps}
+        if context.top_logprobs_num is not None and not has_pds_fields:
+            source_top_logprobs = meta_info.get("output_top_logprobs")
+            if source_top_logprobs is None:
+                raise ValueError("SGLang did not return output_top_logprobs requested by top_logprobs_num.")
+            source_topk_logprobs, source_topk_ids = extract_topk_logprobs(
+                source_top_logprobs,
+                expected_length=len(token_ids),
+                expected_topk=context.top_logprobs_num,
+                field_name="output_top_logprobs",
+            )
+            extra_fields.update(
+                {
+                    "source_topk_logprobs": source_topk_logprobs,
+                    "source_topk_ids": source_topk_ids,
+                }
+            )
+
+        pds_fields = extract_pds_probability_fields(
+            meta_info,
+            output_token_ids=token_ids,
+            expected_topk=context.pds_top_k,
+        )
+        if pds_fields:
+            extra_fields.update(pds_fields)
+            if "fused_log_probs" in pds_fields:
+                log_probs = pds_fields["fused_log_probs"]
+        if context.prompt_logprobs is not None:
+            _extract_prompt_logprobs_sglang(
+                meta_info=meta_info,
+                num_prompt_logprobs=context.prompt_logprobs,
+                sequence_length=len(context.prompt_ids),
+                result_dict=extra_fields,
+            )
+
+        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+            extra_fields["spec_num_draft_tokens"] = int(
+                meta_info.get("spec_draft_token_num", self.config.mtp.speculative_num_draft_tokens)
+            )
+            extra_fields["spec_num_accepted_tokens"] = int(meta_info.get("spec_accept_token_num", 0))
+            extra_fields["spec_num_verify_steps"] = int(meta_info.get("spec_verify_ct", 0))
+
+        return TokenOutput(
+            token_ids=token_ids,
+            log_probs=log_probs,
+            routed_experts=routed_experts,
+            stop_reason=finish_reason,
+            extra_fields=extra_fields,
+        )
+
+    async def _generate_group_local(
+        self,
+        requests: list[dict[str, Any]],
+        *,
+        require_pds_fields: bool = True,
+    ) -> list[TokenOutput]:
+        prepared = [self._prepare_generate_request(**dict(request)) for request in requests]
+        request_dicts = [item[0] for item in prepared]
+        contexts = [item[1] for item in prepared]
+        if any(request.get("image_data") is not None for request in request_dicts):
+            raise NotImplementedError("Synchronized SGLang request groups currently support text-only inputs.")
+
+        batch_request: dict[str, Any] = {
+            "rid": [request["rid"] for request in request_dicts],
+            "input_ids": [request["input_ids"] for request in request_dicts],
+            "sampling_params": [request["sampling_params"] for request in request_dicts],
+            "return_logprob": [request["return_logprob"] for request in request_dicts],
+            "logprob_start_len": [request["logprob_start_len"] for request in request_dicts],
+            "top_logprobs_num": [request["top_logprobs_num"] for request in request_dicts],
+        }
+        if self.config.enable_rollout_routing_replay:
+            batch_request["return_routed_experts"] = True
+        if self.model_config.lora_rank > 0:
+            batch_request["lora_path"] = SGLANG_LORA_NAME
+        if any("bootstrap_room" in request for request in request_dicts):
+            batch_request.update(
+                {
+                    "bootstrap_host": [request.get("bootstrap_host") for request in request_dicts],
+                    "bootstrap_port": [request.get("bootstrap_port") for request in request_dicts],
+                    "bootstrap_room": [request.get("bootstrap_room") for request in request_dicts],
+                }
+            )
+
+        generate_request = GenerateReqInput(**batch_request)
+        with RLInsightLogger.trace_state("sglang_generate_group", state_lane_id=f"replica_{self.replica_rank}"):
+            outputs = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
+        if not isinstance(outputs, list) or len(outputs) != len(contexts):
+            raise RuntimeError(
+                f"SGLang batch generation returned {type(outputs).__name__} with "
+                f"{len(outputs) if isinstance(outputs, list) else 'unknown'} outputs for {len(contexts)} requests."
+            )
+        return [
+            self._convert_generate_output(output, context, require_pds_fields=require_pds_fields)
+            for output, context in zip(outputs, contexts, strict=True)
+        ]
+
     async def generate(
         self,
         prompt_ids: torch.Tensor,
@@ -535,10 +814,6 @@ class SGLangHttpServer:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
     ) -> TokenOutput:
-        # PD top-level dispatch: prefill mints a bootstrap_room and fans out
-        # paired local-prefill + remote-decode calls; decode returns the tokens
-        # (prefill only materialises KV and pushes via NIXL). Random peer
-        # choice avoids systematic skew from heavy-tailed RL prompt lengths.
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and bootstrap_room is None:
             room = secrets.randbits(63)
             decode_peer = self._pd_decode_peers[secrets.randbelow(len(self._pd_decode_peers))]
@@ -565,142 +840,50 @@ class SGLangHttpServer:
             _, decode_output = await asyncio.gather(prefill_coro, decode_coro)
             return decode_output
 
-        # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
-        max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
-
-        if max_possible_tokens < 0:
-            raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
-                f"({self.config.max_model_len})."
-            )
-
-        if "max_new_tokens" in sampling_params:
-            max_new_tokens = sampling_params.pop("max_new_tokens")
-        elif "max_tokens" in sampling_params:
-            # support vllm-style 'max_tokens' param
-            max_new_tokens = sampling_params.pop("max_tokens")
-        else:
-            # Cap max_tokens by response_length to ensure tensor alignment,
-            # and by remaining budget to prevent OOM in multi-turn rollouts.
-            max_new_tokens = min(
-                self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
-            )
-
-        # Clamp max_new_tokens to the valid range [0, max_possible_tokens]
-        max_new_tokens = max(0, min(max_new_tokens, max_possible_tokens))
-
-        assert max_new_tokens <= max_possible_tokens, (
-            f"max_new_tokens {max_new_tokens} exceeds available context space {max_possible_tokens}"
+        request, context = self._prepare_generate_request(
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            image_data=image_data,
+            video_data=video_data,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
         )
-        sampling_params["max_new_tokens"] = max_new_tokens
-        return_logprob = sampling_params.pop("logprobs", False)
-
-        # vLLM-style "prompt_logprobs=K" from the distillation teacher: request
-        # input-token logprobs for every position (top-K when K>0, sampled-token
-        # logprob only when K==0). Translate to SGLang's per-request logprob API.
-        prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
-        if prompt_logprobs is not None:
-            return_logprob = True
-
-        request = {
-            "rid": request_id,
-            "input_ids": prompt_ids,
-            "sampling_params": sampling_params,
-            "return_logprob": return_logprob,
-            "image_data": image_data,
-            # TODO: support video input for sglang
-            # video_data=video_data,
-        }
-
-        if prompt_logprobs is not None:
-            request["logprob_start_len"] = 0
-            if prompt_logprobs > 0:
-                request["top_logprobs_num"] = prompt_logprobs
-
-        if self.config.enable_rollout_routing_replay:
-            request.update({"return_routed_experts": True})
-
-        # SGLang's scheduler rejects disagg-mode requests without bootstrap_room.
-        if bootstrap_room is not None:
-            request["bootstrap_host"] = bootstrap_host
-            request["bootstrap_port"] = bootstrap_port
-            request["bootstrap_room"] = bootstrap_room
-
         generate_request = GenerateReqInput(**request)
-
-        # Add lora request
-        if self.model_config.lora_rank > 0:
-            generate_request.lora_path = SGLANG_LORA_NAME
-
         with RLInsightLogger.trace_state("sglang_generate", state_lane_id=f"replica_{self.replica_rank}"):
             output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
-        meta_info = output.get("meta_info", {})
-        finish_reason = meta_info.get("finish_reason")
-        finish_reason = finish_reason["type"] if finish_reason else None
-        if return_logprob:
-            token_ids = list(output.get("output_ids", []))
-            output_token_logprobs = meta_info.get("output_token_logprobs") or []
-            if output_token_logprobs and len(output_token_logprobs) == len(token_ids):
-                log_probs = [float(log_prob) for log_prob, _, _ in output_token_logprobs]
-            else:
-                # SGLang may return mismatched lengths (e.g. max_new_tokens=0
-                # produces a phantom logprob entry with empty output_ids), or
-                # an abort may leave an empty logprob payload.
-                if len(output_token_logprobs) != len(token_ids):
-                    logger.error(
-                        f"output_token_logprobs length ({len(output_token_logprobs)}) != "
-                        f"output_ids length ({len(token_ids)}) for request {request_id}"
-                    )
-                token_ids = []
-                log_probs = []
-        else:
-            token_ids = output["output_ids"]
-            log_probs = None
+        return self._convert_generate_output(output, context)
 
-        routed_experts = None
-        if self.config.enable_rollout_routing_replay:
-            if self.config.skip_tokenizer_init:
-                # convert to numpy
-                captured = output.get("meta_info", {}).get("routed_experts", None)
-                routed_experts = captured.numpy() if captured is not None else None
-            else:
-                from sglang.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info
-
-                hf_config = self.model_config.hf_config
-                if not hasattr(hf_config, "num_hidden_layers") or not hasattr(hf_config, "num_experts_per_tok"):
-                    raise AttributeError(
-                        "enable_rollout_routing_replay is set, but hf_config is missing "
-                        "'num_hidden_layers' or 'num_experts_per_tok'. This feature requires an MoE model "
-                        "configuration that defines these attributes."
-                    )
-                routed_experts = extract_routed_experts_from_meta_info(output).reshape(
-                    -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
+    async def generate_group(self, requests: list[dict[str, Any]]) -> list[TokenOutput]:
+        """Submit a PDS group as one native SGLang batch request."""
+        if not requests:
+            raise ValueError("generate_group requires at least one request.")
+        if self._disaggregation_role == "prefill" and self._pd_decode_peers:
+            decode_peer = self._pd_decode_peers[secrets.randbelow(len(self._pd_decode_peers))]
+            prefill_requests = []
+            decode_requests = []
+            for original in requests:
+                request = dict(original)
+                request_id = request.pop("request_id")
+                room = secrets.randbits(63)
+                disaggregation_kwargs = {
+                    "bootstrap_host": self._pd_bootstrap_host,
+                    "bootstrap_port": self._disaggregation_bootstrap_port,
+                    "bootstrap_room": room,
+                }
+                prefill_requests.append(
+                    {"request_id": f"{request_id}_P", **request, **disaggregation_kwargs}
                 )
-
-        extra_fields = {"global_steps": self.global_steps}
-        if prompt_logprobs is not None:
-            _extract_prompt_logprobs_sglang(
-                meta_info=meta_info,
-                num_prompt_logprobs=prompt_logprobs,
-                sequence_length=len(prompt_ids),
-                result_dict=extra_fields,
+                decode_requests.append(
+                    {"request_id": f"{request_id}_D", **request, **disaggregation_kwargs}
+                )
+            _, decode_outputs = await asyncio.gather(
+                self._generate_group_local(prefill_requests, require_pds_fields=False),
+                decode_peer.generate_group.remote(requests=decode_requests),
             )
-
-        # Re-key backend spec-decoding stats to the rollout-common names.
-        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
-            extra_fields["spec_num_draft_tokens"] = int(
-                meta_info.get("spec_draft_token_num", self.config.mtp.speculative_num_draft_tokens)
-            )
-            extra_fields["spec_num_accepted_tokens"] = int(meta_info.get("spec_accept_token_num", 0))
-            extra_fields["spec_num_verify_steps"] = int(meta_info.get("spec_verify_ct", 0))
-
-        return TokenOutput(
-            token_ids=token_ids,
-            log_probs=log_probs,
-            routed_experts=routed_experts,
-            stop_reason=finish_reason,
-            extra_fields=extra_fields,
-        )
+            return list(decode_outputs)
+        return await self._generate_group_local(requests)
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""

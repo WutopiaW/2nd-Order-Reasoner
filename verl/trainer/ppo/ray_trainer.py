@@ -922,6 +922,14 @@ class RayPPOTrainer:
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
 
+        # Distillation loss configuration is needed even when its targets are
+        # supplied directly by the rollout engine.
+        self.distillation_config: Optional[DistillationConfig] = (
+            omega_conf_to_dataclass(self.config.distillation)
+            if is_distillation_enabled(self.config.get("distillation"))
+            else None
+        )
+
         # initialize teacher loop manager
         if self.use_teacher_policy:
             from verl.experimental.teacher_loop import MultiTeacherModelManager
@@ -931,10 +939,8 @@ class RayPPOTrainer:
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
-            self.distillation_config = None
 
         # Support custom AgentLoopManager via config
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")

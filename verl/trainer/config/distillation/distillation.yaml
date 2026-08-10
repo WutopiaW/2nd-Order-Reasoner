@@ -13,6 +13,11 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Source of the token-level target distribution:
+# - teacher: compute it with separately configured teacher model(s)
+# - rollout: consume teacher_ids/teacher_logprobs returned by the rollout engine
+target_source: teacher
+
 # distillation loss config
 distillation_loss:
 

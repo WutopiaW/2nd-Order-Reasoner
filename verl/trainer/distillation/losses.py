@@ -43,6 +43,28 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
     return config.enabled
 
 
+def uses_teacher_models(config: Optional[DistillationConfig]) -> bool:
+    """Whether enabled distillation requires separately hosted teacher models."""
+    if not is_distillation_enabled(config):
+        return False
+    if isinstance(config, dict):
+        target_source = config.get("target_source", "teacher")
+    else:
+        target_source = getattr(config, "target_source", "teacher")
+    return target_source == "teacher"
+
+
+def uses_rollout_targets(config: Optional[DistillationConfig]) -> bool:
+    """Whether enabled distillation expects targets in the rollout batch."""
+    if not is_distillation_enabled(config):
+        return False
+    if isinstance(config, dict):
+        target_source = config.get("target_source", "teacher")
+    else:
+        target_source = getattr(config, "target_source", "teacher")
+    return target_source == "rollout"
+
+
 @dataclass
 class DistillationLossSettings(BaseConfig):
     """

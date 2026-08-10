@@ -67,6 +67,25 @@ def build_padding_routed_experts(source_routed_experts: Any, seq_len: int) -> to
     )
 
 
+def build_padding_topk_tensor(
+    source_tensor: Any,
+    *,
+    seq_len: int,
+    fill_value: int | float,
+) -> torch.Tensor | None:
+    """Build a fixed-length synthetic tensor preserving top-k trailing dimensions."""
+    if not isinstance(source_tensor, torch.Tensor):
+        return None
+    if source_tensor.dim() < 2:
+        raise ValueError(f"Expected a per-sequence top-k tensor, got shape {tuple(source_tensor.shape)}.")
+    return torch.full(
+        (seq_len, *source_tensor.shape[1:]),
+        fill_value=fill_value,
+        dtype=source_tensor.dtype,
+        device=source_tensor.device,
+    )
+
+
 def construct_minimal_padding_template(
     source_td: dict,
     source_tag: dict,
@@ -118,6 +137,24 @@ def construct_minimal_padding_template(
         template_sample["routed_experts"] = routed_experts
     else:
         template_sample.pop("routed_experts", None)
+    for prefix in ("teacher", "source_topk", "fused_topk"):
+        ids_key = f"{prefix}_ids"
+        logprobs_key = f"{prefix}_logprobs"
+        ids = build_padding_topk_tensor(
+            template_sample.get(ids_key),
+            seq_len=input_ids.size(0),
+            fill_value=eos_token_id,
+        )
+        logprobs = build_padding_topk_tensor(
+            template_sample.get(logprobs_key),
+            seq_len=input_ids.size(0),
+            fill_value=0.0,
+        )
+        if (ids is None) != (logprobs is None):
+            raise ValueError(f"{prefix} ids and logprobs must either both be present or both be absent.")
+        if ids is not None:
+            template_sample[ids_key] = ids
+            template_sample[logprobs_key] = logprobs
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)

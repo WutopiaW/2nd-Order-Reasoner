@@ -171,17 +171,32 @@ Defaults below are the YAML defaults from
 Whether on-policy distillation is enabled. Default: `false`.
 
 When `true`, `main_ppo` allocates a separate teacher resource pool and spins up
-one or more teacher inference servers; the actor loss switches from `ppo_loss`
-to `distillation_ppo_loss`.
+one or more teacher inference servers when `target_source=teacher`; the actor
+loss switches from `ppo_loss` to `distillation_ppo_loss`.
+
+### `distillation.target_source` (str)
+
+Where token-level distillation targets come from. Default: `"teacher"`.
+
+- `"teacher"` preserves standard OPD behavior and launches the configured
+  teacher model server(s).
+- `"rollout"` consumes `teacher_ids` and `teacher_logprobs` already attached
+  to rollout samples. No teacher model or teacher resource pool is created.
+
+The rollout producer is responsible for aligning these tensors with causal-LM
+logit positions. The memory-augmented mix-sglang example under
+`examples/opsd_memory` uses this mode.
 
 ### `distillation.n_gpus_per_node` (int)
 
 Number of GPUs per node in the teacher resource pool. Default: `8`.
+Ignored when `target_source=rollout`.
 
 ### `distillation.nnodes` (int)
 
 Number of nodes in the teacher resource pool. Default: `0` (effectively
-disables the pool — must be set to `≥ 1` when `enabled=True`).
+disables the pool — must be set to `≥ 1` when `enabled=True` and
+`target_source=teacher`). Ignored when `target_source=rollout`.
 
 **Constraint:** the total teacher pool size (`n_gpus_per_node × nnodes`) must
 exactly equal the sum of `(num_replicas × per_replica_world_size)` across all

@@ -18,7 +18,7 @@ from enum import Enum
 from omegaconf import DictConfig
 
 from verl.single_controller.base import Worker
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import uses_teacher_models
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 
 WorkerType = type[Worker]
@@ -83,7 +83,7 @@ def need_teacher_policy(
     config: DictConfig,
 ) -> bool:
     """Given the config, do we need distillation policy."""
-    return is_distillation_enabled(config.get("distillation"))
+    return uses_teacher_models(config.get("distillation"))
 
 
 def need_reward_model(

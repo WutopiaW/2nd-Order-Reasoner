@@ -772,11 +772,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         NOTE: MultiTeacherModelManager.__init__ calls _run_all internally which uses
         asyncio.run(), conflicting with the already-running event loop. Run in a thread executor.
         """
-        from verl.trainer.distillation.losses import is_distillation_enabled
-        from verl.trainer.ppo.utils import Role
+        from verl.trainer.ppo.utils import Role, need_teacher_policy
 
         self.teacher_model_manager = None
-        if is_distillation_enabled(self.config.get("distillation")):
+        if need_teacher_policy(self.config):
             from verl.experimental.teacher_loop import MultiTeacherModelManager
 
             resource_pool_spec = {}

@@ -48,7 +48,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import is_distillation_enabled, uses_rollout_targets, uses_teacher_models
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
@@ -90,6 +90,8 @@ class AgentLoopMetrics(BaseModel):
 class AgentLoopOutput(BaseModel):
     """Agent loop output."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     prompt_ids: list[int]
     """Prompt token ids."""
     response_ids: list[int]
@@ -98,6 +100,14 @@ class AgentLoopOutput(BaseModel):
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
+    source_topk_ids: Optional[torch.Tensor] = None
+    """Full-sequence aligned top-k token ids from the prompt-A rollout distribution."""
+    source_topk_logprobs: Optional[torch.Tensor] = None
+    """Full-sequence aligned top-k logprobs from the prompt-A rollout distribution."""
+    fused_topk_ids: Optional[torch.Tensor] = None
+    """Full-sequence aligned top-k token ids from the mixed behavior distribution."""
+    fused_topk_logprobs: Optional[torch.Tensor] = None
+    """Full-sequence aligned top-k logprobs from the mixed behavior distribution."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -517,7 +527,9 @@ class AgentLoopWorker:
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
-        if self.distillation_enabled:
+        self.teacher_policy_enabled = uses_teacher_models(config.distillation)
+        self.rollout_distillation_enabled = uses_rollout_targets(config.distillation)
+        if self.teacher_policy_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
             self.teacher_key: str = config.distillation.teacher_key
@@ -690,7 +702,11 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            output: AgentLoopOutput = await agent_loop.run(
+                sampling_params,
+                __validate__=trajectory["validate"],
+                **kwargs,
+            )
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -843,6 +859,38 @@ class AgentLoopWorker:
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
+        def pad_topk_distribution(
+            ids: Optional[torch.Tensor],
+            logprobs: Optional[torch.Tensor],
+            name: str,
+        ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+            if (ids is None) != (logprobs is None):
+                raise RuntimeError(f"{name} ids and logprobs must either both be present or both be absent.")
+            if ids is None:
+                return None, None
+            from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
+
+            return _pad_teacher_outputs(
+                ids,
+                logprobs,
+                prompt_width=prompt_output["input_ids"].shape[1],
+                response_width=response_output["input_ids"].shape[1],
+                prompt_length=len(output.prompt_ids),
+                response_length=len(output.response_ids),
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+
+        source_topk_ids, source_topk_logprobs = pad_topk_distribution(
+            output.source_topk_ids,
+            output.source_topk_logprobs,
+            "source_topk",
+        )
+        fused_topk_ids, fused_topk_logprobs = pad_topk_distribution(
+            output.fused_topk_ids,
+            output.fused_topk_logprobs,
+            "fused_topk",
+        )
+
         return _InternalAgentLoopOutput(
             prompt_ids=prompt_output["input_ids"],
             response_ids=response_output["input_ids"],
@@ -857,6 +905,10 @@ class AgentLoopWorker:
             mm_processor_kwargs=output.mm_processor_kwargs,
             teacher_logprobs=teacher_logprobs,
             teacher_ids=teacher_ids,
+            source_topk_ids=source_topk_ids,
+            source_topk_logprobs=source_topk_logprobs,
+            fused_topk_ids=fused_topk_ids,
+            fused_topk_logprobs=fused_topk_logprobs,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -1012,7 +1064,12 @@ class AgentLoopWorker:
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
-        if self.distillation_enabled and not validate:
+        teacher_policy_enabled = getattr(
+            self,
+            "teacher_policy_enabled",
+            getattr(self, "distillation_enabled", False),
+        )
+        if teacher_policy_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
@@ -1027,6 +1084,15 @@ class AgentLoopWorker:
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+        if getattr(self, "rollout_distillation_enabled", False) and not validate:
+            missing = [
+                key for key in ("teacher_ids", "teacher_logprobs") if output.extra_fields.get(key) is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "distillation.target_source=rollout requires the agent loop to return "
+                    f"{missing} in AgentLoopOutput.extra_fields."
+                )
 
     def _postprocess(
         self,
@@ -1050,6 +1116,18 @@ class AgentLoopWorker:
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        for prefix in ("source_topk", "fused_topk"):
+            ids = getattr(inputs[0], f"{prefix}_ids")
+            logprobs = getattr(inputs[0], f"{prefix}_logprobs")
+            if ids is not None and logprobs is not None:
+                optional_outputs[f"{prefix}_ids"] = torch.cat(
+                    [getattr(input, f"{prefix}_ids") for input in inputs],
+                    dim=0,
+                )
+                optional_outputs[f"{prefix}_logprobs"] = torch.cat(
+                    [getattr(input, f"{prefix}_logprobs") for input in inputs],
+                    dim=0,
+                )
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]

@@ -1,0 +1,24 @@
+- name: opsd_memory_agent
+  _target_: verl.experimental.agent_loop.opsd_memory_agent_loop.OPSDMemoryAgentLoop
+  target_topk: ${oc.env:OPSD_TARGET_TOPK,32}
+  summary_max_tokens: 256
+  min_response_tokens: 32
+  memory_capacity: 100000
+  # Set a stable name to share one memory actor across all AgentLoop workers.
+  # When null, a Ray-job-scoped name is generated.
+  memory_actor_name: null
+  # A semantic embedding model is required by the production recipe.
+  memory_embedder:
+    _target_: verl.experimental.agent_loop.trajectory_memory.HuggingFaceTextEmbedder
+    model_path: ${oc.env:OPSD_EMBEDDING_MODEL}
+    device: cpu
+    trust_remote_code: false
+    max_length: 512
+  # Dependency-free lexical fallback for smoke tests only:
+  # memory_embedder:
+  #   _target_: verl.experimental.agent_loop.trajectory_memory.HashingTextEmbedder
+  #   dimension: 2048
+  #   min_ngram: 2
+  #   max_ngram: 4
+  prompt_a_fuse_weight: 1.0
+  prompt_b_fuse_weight: 1.0

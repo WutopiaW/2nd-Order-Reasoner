@@ -337,6 +337,14 @@ class PPOTrainer(ABC):
         )
         logger.info("reward loop manager initialized")
 
+        # Distillation loss configuration is needed even when its targets are
+        # supplied directly by the rollout engine.
+        self.distillation_config: Optional[DistillationConfig] = (
+            omega_conf_to_dataclass(self.config.distillation)
+            if is_distillation_enabled(self.config.get("distillation"))
+            else None
+        )
+
         # 8. initialize teacher loop manager
         if self.use_teacher_policy:
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
@@ -344,10 +352,8 @@ class PPOTrainer(ABC):
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
-            self.distillation_config = None
 
         # 9. initialize agent loop manager
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
@@ -781,7 +787,7 @@ class PPOTrainer(ABC):
             self.mapping[Role.RewardModel] = "global_pool"
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if need_teacher_policy(config):
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:

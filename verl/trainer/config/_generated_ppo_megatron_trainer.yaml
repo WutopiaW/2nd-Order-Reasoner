@@ -906,6 +906,7 @@ algorithm:
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
+  target_source: teacher
   distillation_loss:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3

@@ -224,6 +224,9 @@ class DistillationConfig(BaseConfig):
 
     enabled (bool):
         Whether on-policy distillation is enabled.
+    target_source (str):
+        ``"teacher"`` launches separately hosted teacher models. ``"rollout"``
+        consumes token-level targets emitted while collecting trajectories.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -260,6 +263,9 @@ class DistillationConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
     enabled: bool = False
+    # "teacher" launches separately configured teacher model(s). "rollout"
+    # consumes teacher_ids/teacher_logprobs produced by the rollout engine.
+    target_source: str = "teacher"
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -267,7 +273,16 @@ class DistillationConfig(BaseConfig):
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
     def __post_init__(self):
+        if self.target_source not in {"teacher", "rollout"}:
+            raise ValueError(
+                f"Unsupported distillation target_source {self.target_source!r}; "
+                "expected one of ['rollout', 'teacher']."
+            )
         if not self.enabled:
+            return
+        if self.target_source == "rollout":
+            # Self-distillation targets share the actor rollout resource pool,
+            # so no external teacher configuration or resource pool is needed.
             return
 
         self.teacher_models = self._resolve_teacher_models()
