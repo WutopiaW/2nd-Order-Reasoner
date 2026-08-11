@@ -90,8 +90,8 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
             raise RuntimeError(f"{prefix} ids and logprobs must either both be present or both be absent.")
         if topk_logprobs is None:
             continue
-        topk_logprobs_rmpad = index_first_axis(topk_logprobs.unsqueeze(-1).flatten(0, 1), indices)
-        topk_ids_rmpad = index_first_axis(topk_ids.unsqueeze(-1).flatten(0, 1), indices)
+        topk_logprobs_rmpad = index_first_axis(topk_logprobs.flatten(0, 1), indices)
+        topk_ids_rmpad = index_first_axis(topk_ids.flatten(0, 1), indices)
         data[logprobs_key] = torch.nested.nested_tensor_from_jagged(
             topk_logprobs_rmpad.squeeze(-1),
             offsets=cu_seqlens,

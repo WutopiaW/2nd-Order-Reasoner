@@ -7,6 +7,10 @@
   # Set a stable name to share one memory actor across all AgentLoop workers.
   # When null, a Ray-job-scoped name is generated.
   memory_actor_name: null
+  # Persist every training-time memory insertion immediately so completed
+  # rollout trajectories survive a later trainer failure or OOM.
+  memory_output_path: ${oc.env:OPSD_MEMORY_OUTPUT,''}
+  memory_seed_path: ${oc.env:OPSD_MEMORY_SEED,''}
   # A semantic embedding model is required by the production recipe.
   memory_embedder:
     _target_: verl.experimental.agent_loop.trajectory_memory.HuggingFaceTextEmbedder

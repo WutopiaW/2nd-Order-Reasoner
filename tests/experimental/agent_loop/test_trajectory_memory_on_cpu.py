@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -21,6 +23,7 @@ from verl.experimental.agent_loop.trajectory_memory import (
     HashingTextEmbedder,
     TrajectoryMemory,
     TrajectoryRecord,
+    append_memory_record,
 )
 
 
@@ -58,6 +61,30 @@ def test_memory_state_round_trip_and_dimension_validation():
     np.testing.assert_allclose(restored.get("r1").embedding, [0.6, 0.8])
     with pytest.raises(ValueError, match="dimension"):
         restored.search([1.0, 0.0, 0.0])
+
+
+def test_append_memory_record_writes_readable_jsonl_without_embedding(tmp_path):
+    output_path = tmp_path / "memory" / "trajectories.jsonl"
+    record = TrajectoryRecord(
+        request_id="request-1",
+        prompt="current problem",
+        trajectory="reasoning trajectory",
+        summary="reusable summary",
+        embedding=[0.6, 0.8],
+        metadata={"retrieved_request_id": "request-0", "retrieval_score": 0.75},
+    )
+
+    append_memory_record(output_path, record, memory_size=2)
+
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+    assert saved == {
+        "request_id": "request-1",
+        "prompt": "current problem",
+        "trajectory": "reasoning trajectory",
+        "summary": "reusable summary",
+        "metadata": {"retrieved_request_id": "request-0", "retrieval_score": 0.75},
+        "memory_size": 2,
+    }
 
 
 def test_align_response_topk_targets_uses_causal_lm_positions():

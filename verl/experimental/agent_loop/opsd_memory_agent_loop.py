@@ -107,6 +107,8 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
         memory_capacity: int = 100_000,
         memory_actor_name: str | None = None,
         memory_embedder: dict[str, Any] | None = None,
+        memory_output_path: str | None = None,
+        memory_seed_path: str | None = None,
         prompt_a_fuse_weight: float = 1.0,
         prompt_b_fuse_weight: float = 1.0,
         **kwargs,
@@ -163,9 +165,12 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
         self.memory = TrajectoryMemoryActor.options(
             name=memory_actor_name,
             get_if_exists=True,
+            lifetime="detached",
         ).remote(
             capacity=memory_capacity,
             embedder=memory_embedder,
+            output_path=memory_output_path,
+            seed_path=memory_seed_path,
         )
 
     async def run(

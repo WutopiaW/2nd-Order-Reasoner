@@ -1,4 +1,4 @@
-ye# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,9 +16,11 @@ ye# Copyright 2026 Bytedance Ltd. and/or its affiliates
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
@@ -197,20 +199,67 @@ class TrajectoryMemory:
         return array / norm
 
 
+def append_memory_record(path: str | Path, record: TrajectoryRecord, *, memory_size: int) -> None:
+    """Append one readable trajectory record to a UTF-8 JSONL journal.
+
+    Embeddings are intentionally omitted: the configured embedder can rebuild
+    them, while keeping the journal small makes it practical to inspect during
+    a training run that may later fail or OOM.
+    """
+    output_path = Path(path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = asdict(record)
+    payload.pop("embedding", None)
+    payload["memory_size"] = memory_size
+    with output_path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n")
+
+
 @ray.remote
 class TrajectoryMemoryActor:
     """Ray-owned global memory shared by all agent-loop workers."""
 
-    def __init__(self, capacity: int = 100_000, embedder: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        capacity: int = 100_000,
+        embedder: dict[str, Any] | TextEmbedder | None = None,
+        output_path: str | None = None,
+        seed_path: str | None = None,
+    ):
         import hydra
         from omegaconf import OmegaConf
 
         self.memory = TrajectoryMemory(capacity=capacity)
         if embedder is None:
             self.embedder: TextEmbedder = HashingTextEmbedder()
+        elif callable(getattr(embedder, "encode", None)):
+            # Hydra recursively instantiates nested ``_target_`` values before
+            # constructing the agent loop. Ray then serializes that ready-to-use
+            # embedder into this actor, so it must not be treated as config again.
+            self.embedder = embedder
         else:
             embedder_config = OmegaConf.create(embedder)
             self.embedder = hydra.utils.instantiate(embedder_config)
+        self.output_path = output_path or None
+        if seed_path:
+            seed_file = Path(seed_path).expanduser().resolve()
+            with seed_file.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    payload = json.loads(line)
+                    try:
+                        record = TrajectoryRecord(
+                            request_id=str(payload["request_id"]),
+                            prompt=str(payload["prompt"]),
+                            trajectory=str(payload["trajectory"]),
+                            summary=str(payload["summary"]),
+                            embedding=self.embedder.encode(str(payload["prompt"])),
+                            metadata=dict(payload.get("metadata") or {}),
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise ValueError(f"Invalid memory seed record at {seed_file}:{line_number}") from error
+                    self.memory.upsert(record)
 
     def search(self, prompt: str, exclude_request_id: str | None = None) -> dict[str, Any] | None:
         embedding = self.embedder.encode(prompt)
@@ -227,16 +276,19 @@ class TrajectoryMemoryActor:
         summary: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        self.memory.upsert(
-            TrajectoryRecord(
-                request_id=request_id,
-                prompt=prompt,
-                trajectory=trajectory,
-                summary=summary,
-                embedding=self.embedder.encode(prompt),
-                metadata=metadata or {},
-            )
+        record = TrajectoryRecord(
+            request_id=request_id,
+            prompt=prompt,
+            trajectory=trajectory,
+            summary=summary,
+            embedding=self.embedder.encode(prompt),
+            metadata=metadata or {},
         )
+        self.memory.upsert(record)
+        if self.output_path is not None:
+            normalized_record = self.memory.get(request_id)
+            assert normalized_record is not None
+            append_memory_record(self.output_path, normalized_record, memory_size=len(self.memory))
 
     def get(self, request_id: str) -> dict[str, Any] | None:
         record = self.memory.get(request_id)

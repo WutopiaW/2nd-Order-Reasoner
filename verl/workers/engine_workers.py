@@ -320,11 +320,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     for key, val in output.items():
                         # flattn dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.aggregate_dp(val)
-                                if isinstance(val[0], Metric)
-                                else list(chain.from_iterable(val))
-                            )
+                            if val and isinstance(val[0], Metric):
+                                output[key] = Metric.aggregate_dp(val)
+                            elif val and all(isinstance(item, list) for item in val):
+                                output[key] = list(chain.from_iterable(val))
                     append_to_dict(metrics, output)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
