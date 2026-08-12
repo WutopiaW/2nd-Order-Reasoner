@@ -387,6 +387,7 @@ class AgentLoopBase(ABC):
         audios: list[Any] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         remove_system_prompt: bool = False,
+        cap_prompt_length: bool = True,
     ):
         """Apply chat template to messages with optional tools, images, and videos.
 
@@ -447,7 +448,7 @@ class AgentLoopBase(ABC):
         # Multimodal prompts cannot be sliced here because placeholder tokens must remain
         # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
         prompt_length = self.rollout_config.prompt_length
-        if len(prompt_ids) > prompt_length:
+        if cap_prompt_length and len(prompt_ids) > prompt_length:
             if images or videos or audios:
                 raise ValueError(
                     f"Multimodal prompt produced {len(prompt_ids)} tokens, exceeding "

@@ -26,7 +26,6 @@ from verl.experimental.agent_loop.trajectory_memory import TrajectoryMemoryActor
 from verl.utils.profiler import simple_timer
 from verl.workers.rollout.replica import TokenOutput
 
-
 DEFAULT_PROMPT_B_TEMPLATE = """A previous attempt on a semantically related problem is provided below.
 
 Previous summary:
@@ -49,6 +48,56 @@ Problem:
 Trajectory:
 {trajectory}
 """
+
+
+def decode_complete_generated_text(tokenizer: Any, token_ids: list[int]) -> str:
+    """Decode generated tokens without retaining an incomplete trailing byte token."""
+    complete_ids = list(token_ids)
+    text = tokenizer.decode(complete_ids, skip_special_tokens=True)
+    while complete_ids and text.rstrip().endswith("\ufffd"):
+        complete_ids.pop()
+        text = tokenizer.decode(complete_ids, skip_special_tokens=True)
+    return text
+
+
+def compute_paired_generation_budget(
+    *,
+    prompt_a_length: int,
+    prompt_a_max_total_tokens: int,
+    response_length: int,
+    physical_context_length: int,
+) -> tuple[int, int]:
+    """Return the shared generation limit and prompt-B budget.
+
+    Prompt A owns the logical sequence-length contract. Prompt B may be longer
+    because it carries retrieved memory, but it must fit in the physical model
+    context without reducing A's generation allowance.
+    """
+    if prompt_a_length <= 0:
+        raise ValueError(f"prompt_a_length must be positive, got {prompt_a_length}.")
+    if prompt_a_max_total_tokens <= 0:
+        raise ValueError(f"prompt_a_max_total_tokens must be positive, got {prompt_a_max_total_tokens}.")
+    if response_length <= 0:
+        raise ValueError(f"response_length must be positive, got {response_length}.")
+    if physical_context_length <= 0:
+        raise ValueError(f"physical_context_length must be positive, got {physical_context_length}.")
+
+    generation_limit = min(response_length, prompt_a_max_total_tokens - prompt_a_length)
+    if generation_limit <= 0:
+        raise ValueError(
+            "No generation budget remains under prompt A's logical total-token limit: "
+            f"{prompt_a_length=} >= {prompt_a_max_total_tokens=}."
+        )
+
+    # SGLang reserves one context position in its request guard.
+    prompt_b_budget = physical_context_length - generation_limit - 1
+    if prompt_b_budget < prompt_a_length:
+        raise ValueError(
+            "The physical model context cannot preserve prompt A's generation budget: "
+            f"need at least {prompt_a_length + generation_limit + 1} tokens, "
+            f"got {physical_context_length}."
+        )
+    return generation_limit, prompt_b_budget
 
 
 def align_response_topk_targets(
@@ -104,6 +153,7 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
         summary_template: str = DEFAULT_SUMMARY_TEMPLATE,
         summary_max_tokens: int = 256,
         min_response_tokens: int = 32,
+        prompt_a_max_total_tokens: int | None = None,
         memory_capacity: int = 100_000,
         memory_actor_name: str | None = None,
         memory_embedder: dict[str, Any] | None = None,
@@ -118,6 +168,9 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
         summary_max_tokens = int(summary_max_tokens)
         min_response_tokens = int(min_response_tokens)
         memory_capacity = int(memory_capacity)
+        if prompt_a_max_total_tokens is None:
+            prompt_a_max_total_tokens = self.rollout_config.prompt_length + self.rollout_config.response_length
+        prompt_a_max_total_tokens = int(prompt_a_max_total_tokens)
         if target_topk <= 0:
             raise ValueError(f"target_topk must be positive, got {target_topk}.")
         if summary_max_tokens <= 0:
@@ -132,6 +185,7 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
         self.summary_template = summary_template
         self.summary_max_tokens = summary_max_tokens
         self.min_response_tokens = min_response_tokens
+        self.prompt_a_max_total_tokens = prompt_a_max_total_tokens
         self.prompt_a_fuse_weight = float(prompt_a_fuse_weight)
         self.prompt_b_fuse_weight = float(prompt_b_fuse_weight)
         if self.prompt_a_fuse_weight < 0 or self.prompt_b_fuse_weight < 0:
@@ -190,6 +244,13 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
         request_id = uuid4().hex
 
         retrieved = await self.memory.search.remote(prompt_a_text, exclude_request_id=request_id)
+        generation_limit, prompt_b_budget = compute_paired_generation_budget(
+            prompt_a_length=len(prompt_a_ids),
+            prompt_a_max_total_tokens=self.prompt_a_max_total_tokens,
+            response_length=self.rollout_config.response_length,
+            physical_context_length=self._context_limit(),
+        )
+
         if retrieved is None:
             memory_request_id = None
             memory_score = None
@@ -215,24 +276,7 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
                     "memory_trajectory": memory_trajectory,
                 },
                 trim_order=("memory_trajectory", "memory_summary"),
-                max_prompt_tokens=self._context_limit() - self.min_response_tokens - 1,
-            )
-
-        generation_limit = min(
-            self.rollout_config.response_length,
-            self.rollout_config.prompt_length + self.rollout_config.response_length - max(
-                len(prompt_a_ids), len(prompt_b_ids)
-            ),
-        )
-        if self.rollout_config.max_model_len is not None:
-            generation_limit = min(
-                generation_limit,
-                self.rollout_config.max_model_len - max(len(prompt_a_ids), len(prompt_b_ids)) - 1,
-            )
-        if generation_limit <= 0:
-            raise ValueError(
-                "No shared generation budget remains for the OPSD prompt pair: "
-                f"{len(prompt_a_ids)=}, {len(prompt_b_ids)=}."
+                max_prompt_tokens=prompt_b_budget,
             )
 
         sample_group = f"opsd-{request_id}"
@@ -309,7 +353,7 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
             pad_token_id=self.tokenizer.pad_token_id or 0,
         )
 
-        trajectory = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+        trajectory = decode_complete_generated_text(self.tokenizer, response_ids)
         summary = await self._summarize(
             request_id=request_id,
             prompt_a=prompt_a_text,
@@ -424,13 +468,12 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
             },
             priority=priority,
         )
-        return self.tokenizer.decode(summary_output.token_ids, skip_special_tokens=True).strip()
+        return decode_complete_generated_text(self.tokenizer, summary_output.token_ids).strip()
 
     def _context_limit(self) -> int:
-        context_limit = self.rollout_config.prompt_length + self.rollout_config.response_length
         if self.rollout_config.max_model_len is not None:
-            context_limit = min(context_limit, self.rollout_config.max_model_len)
-        return context_limit
+            return int(self.rollout_config.max_model_len)
+        return self.rollout_config.prompt_length + self.rollout_config.response_length
 
     async def _render_prompt_with_budget(
         self,
@@ -447,7 +490,7 @@ class OPSDMemoryAgentLoop(AgentLoopBase):
 
         async def render() -> tuple[str, list[int]]:
             text = template.format(**fields)
-            ids = await self.apply_chat_template([{"role": "user", "content": text}])
+            ids = await self.apply_chat_template([{"role": "user", "content": text}], cap_prompt_length=False)
             return text, ids
 
         text, prompt_ids = await render()

@@ -3,6 +3,7 @@
   target_topk: ${oc.env:OPSD_TARGET_TOPK,32}
   summary_max_tokens: 256
   min_response_tokens: 32
+  prompt_a_max_total_tokens: ${oc.env:OPSD_PROMPT_A_MAX_TOTAL_TOKENS,1024}
   memory_capacity: 100000
   # Set a stable name to share one memory actor across all AgentLoop workers.
   # When null, a Ray-job-scoped name is generated.
