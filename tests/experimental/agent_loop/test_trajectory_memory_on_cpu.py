@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 from types import SimpleNamespace
 
@@ -19,11 +20,12 @@ import numpy as np
 import pytest
 import torch
 
-from verl.experimental.agent_loop.opsd_memory_agent_loop import (
-    OPSDMemoryAgentLoop,
-    align_response_topk_targets,
-    compute_paired_generation_budget,
-    decode_complete_generated_text,
+from verl.experimental.agent_loop.opsd_memory_base import (
+    OPSDMemoryAgentLoopBase,
+    OPSDMemoryContext,
+    OPSDPromptPair,
+    OPSDTrajectoryTargetAccumulator,
+    OPSDTurnOutput,
 )
 from verl.experimental.agent_loop.trajectory_memory import (
     HashingTextEmbedder,
@@ -31,6 +33,11 @@ from verl.experimental.agent_loop.trajectory_memory import (
     TrajectoryRecord,
     append_memory_record,
 )
+
+
+def test_opsd_base_leaves_run_to_the_concrete_agent_loop():
+    assert "run" not in OPSDMemoryAgentLoopBase.__dict__
+    assert inspect.isabstract(OPSDMemoryAgentLoopBase)
 
 
 def test_hashing_embedder_prefers_lexically_related_text():
@@ -93,74 +100,94 @@ def test_append_memory_record_writes_readable_jsonl_without_embedding(tmp_path):
     }
 
 
-def test_align_response_topk_targets_uses_causal_lm_positions():
-    teacher_ids, teacher_logprobs = align_response_topk_targets(
-        prompt_length=3,
-        topk_ids=[[10, 11], [20, 21]],
-        topk_logprobs=[[-0.1, -2.0], [-0.2, -1.8]],
-        pad_token_id=0,
+def _turn(token_ids, *, first_target_id):
+    length = len(token_ids)
+    pair = OPSDPromptPair(prompt_a_ids=[1], prompt_b_ids=[1, 2], max_new_tokens=length)
+    return OPSDTurnOutput(
+        prompt_pair=pair,
+        token_ids=token_ids,
+        source_logprobs=[-0.3] * length,
+        fused_logprobs=[-0.2] * length,
+        source_topk_ids=[[first_target_id + i, 90] for i in range(length)],
+        source_topk_logprobs=[[-0.3, -2.0] for _ in range(length)],
+        fused_topk_ids=[[first_target_id + i, 91] for i in range(length)],
+        fused_topk_logprobs=[[-0.2, -1.8] for _ in range(length)],
+        stop_reason="stop",
+        num_preempted=0,
     )
 
-    assert teacher_ids.dtype == torch.int32
-    assert teacher_ids.tolist() == [
+
+def test_multiturn_targets_skip_tool_tokens_and_use_causal_lm_positions():
+    accumulator = OPSDTrajectoryTargetAccumulator(prompt_ids=[1, 2, 3], target_topk=2, pad_token_id=0)
+    accumulator.record_model_turn(_turn([10, 11], first_target_id=10), response_start=0)
+    accumulator.record_model_turn(_turn([20], first_target_id=20), response_start=4)
+
+    targets = accumulator.finalize(
+        response_ids=[10, 11, 70, 71, 20],
+        response_mask=[1, 1, 0, 0, 1],
+    )
+
+    assert targets.source_topk_ids.dtype == torch.int32
+    assert targets.source_topk_ids.tolist() == [
         [0, 0],
         [0, 0],
-        [10, 11],
-        [20, 21],
+        [10, 90],
+        [11, 90],
+        [0, 0],
+        [0, 0],
+        [20, 90],
         [0, 0],
     ]
-    torch.testing.assert_close(
-        teacher_logprobs,
-        torch.tensor(
-            [
-                [0.0, 0.0],
-                [0.0, 0.0],
-                [-0.1, -2.0],
-                [-0.2, -1.8],
-                [0.0, 0.0],
-            ]
-        ),
-    )
+    assert targets.response_logprobs == pytest.approx([-0.2, -0.2, 0.0, 0.0, -0.2])
+    torch.testing.assert_close(targets.fused_topk_logprobs[4:6], torch.zeros((2, 2)))
 
 
-def test_align_response_topk_targets_rejects_ragged_distributions():
-    with pytest.raises(ValueError, match="Inconsistent top-k width"):
-        align_response_topk_targets(
-            prompt_length=1,
-            topk_ids=[[1, 2], [3]],
-            topk_logprobs=[[-0.1, -0.2], [-0.3]],
-            pad_token_id=0,
-        )
+def test_multiturn_targets_fail_when_a_model_position_has_no_pds_target():
+    accumulator = OPSDTrajectoryTargetAccumulator(prompt_ids=[1], target_topk=2, pad_token_id=0)
+    accumulator.record_model_turn(_turn([10], first_target_id=10), response_start=0)
 
-
-def test_decode_complete_generated_text_drops_only_incomplete_trailing_tokens():
-    class ByteBoundaryTokenizer:
-        @staticmethod
-        def decode(token_ids, skip_special_tokens=True):
-            del skip_special_tokens
-            pieces = {1: "complete ", 2: "text", 3: "\ufffd", 4: "   "}
-            return "".join(pieces[token_id] for token_id in token_ids)
-
-    assert decode_complete_generated_text(ByteBoundaryTokenizer(), [1, 2, 3, 4]) == "complete text"
-    assert decode_complete_generated_text(ByteBoundaryTokenizer(), [1, 3, 2]) == "complete \ufffdtext"
-
-
-def test_prompt_b_length_does_not_reduce_prompt_a_generation_budget():
-    generation_limit, prompt_b_budget = compute_paired_generation_budget(
-        prompt_a_length=128,
-        prompt_a_max_total_tokens=1024,
-        response_length=1024,
-        physical_context_length=4096,
-    )
-
-    assert generation_limit == 896
-    assert prompt_b_budget == 3199
-    assert prompt_b_budget >= 2048
-    assert 2048 + generation_limit + 1 <= 4096
+    with pytest.raises(ValueError, match="do not cover exactly"):
+        accumulator.finalize(response_ids=[10, 11], response_mask=[1, 1])
 
 
 @pytest.mark.asyncio
-async def test_prompt_b_can_exceed_generic_prompt_cap_without_truncation():
+async def test_prompt_pair_uses_explicit_max_new_tokens_without_prompt_a_budget_math():
+    loop = SimpleNamespace(memory_prompt_max_length=2048)
+    prompt_a_ids = list(range(3000))
+
+    pair = await OPSDMemoryAgentLoopBase.initialize_prompt_pair(
+        loop,
+        prompt_a_ids=prompt_a_ids,
+        memory_context=OPSDMemoryContext(request_id="request-1", prompt_a_text="problem"),
+        max_new_tokens=777,
+    )
+
+    assert pair.prompt_a_ids == prompt_a_ids
+    assert pair.prompt_b_ids == prompt_a_ids
+    assert pair.max_new_tokens == 777
+
+
+@pytest.mark.asyncio
+async def test_initial_prompt_a_is_checked_after_chat_template_without_silent_truncation():
+    cap_prompt_length_values = []
+
+    async def apply_chat_template(messages, cap_prompt_length=True, **kwargs):
+        del messages, kwargs
+        cap_prompt_length_values.append(cap_prompt_length)
+        return [1, 2, 3, 4, 5]
+
+    loop = SimpleNamespace(
+        apply_chat_template=apply_chat_template,
+        rollout_config=SimpleNamespace(prompt_length=4),
+    )
+    with pytest.raises(ValueError, match="after applying the chat template"):
+        await OPSDMemoryAgentLoopBase.initialize_prompt_a(loop, [{"role": "user", "content": "x"}])
+
+    assert cap_prompt_length_values == [False]
+
+
+@pytest.mark.asyncio
+async def test_prompt_b_is_trimmed_to_explicit_memory_prompt_cap():
     class WhitespaceTokenizer:
         @staticmethod
         def encode(text, add_special_tokens=False):
@@ -186,7 +213,7 @@ async def test_prompt_b_can_exceed_generic_prompt_cap_without_truncation():
     memory_trajectory = " ".join(["trajectory"] * 1800)
     memory_summary = " ".join(["summary"] * 120)
 
-    _, prompt_b_ids = await OPSDMemoryAgentLoop._render_prompt_with_budget(
+    _, prompt_b_ids = await OPSDMemoryAgentLoopBase._render_prompt_with_budget(
         loop,
         template="{prompt_a} {memory_trajectory} {memory_summary}",
         fields={
@@ -195,18 +222,9 @@ async def test_prompt_b_can_exceed_generic_prompt_cap_without_truncation():
             "memory_summary": memory_summary,
         },
         trim_order=("memory_trajectory", "memory_summary"),
-        max_prompt_tokens=3199,
+        max_prompt_tokens=512,
     )
 
-    assert len(prompt_b_ids) == 2048
-    assert cap_prompt_length_values == [False]
-
-
-def test_physical_context_must_preserve_prompt_a_generation_budget():
-    with pytest.raises(ValueError, match="cannot preserve prompt A"):
-        compute_paired_generation_budget(
-            prompt_a_length=128,
-            prompt_a_max_total_tokens=1024,
-            response_length=1024,
-            physical_context_length=900,
-        )
+    assert len(prompt_b_ids) <= 512
+    assert len(prompt_b_ids) > 128
+    assert cap_prompt_length_values and all(value is False for value in cap_prompt_length_values)

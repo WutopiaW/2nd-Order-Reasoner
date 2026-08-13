@@ -227,6 +227,9 @@ class LLMServerClient:
 
     @staticmethod
     def _finalize_output(output: TokenOutput) -> TokenOutput:
+        # TODO(opsd-memory): Revisit whether this normalization belongs in the client. The v1 trainer
+        # currently requires both fields for trajectory-version metrics, so keep it until every caller
+        # either receives them from the backend or initializes them while assembling the trajectory.
         global_steps = output.extra_fields.get("global_steps")
         output.extra_fields.setdefault("min_global_steps", global_steps)
         output.extra_fields.setdefault("max_global_steps", global_steps)

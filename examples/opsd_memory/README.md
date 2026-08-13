@@ -18,7 +18,12 @@ the A/B mixture, rather than a separately hosted teacher.
 
 ## Components
 
-- `agent.yaml` configures `OPSDMemoryAgentLoop`.
+- `agent.yaml` configures `SingleTurnOPSDMemoryAgentLoop`, the thin one-shot
+  specialization used by this math example.
+- `OPSDMemoryAgentLoopBase` deliberately has no `run` implementation. It
+  exposes memory lookup, prompt-pair construction, paired generation, output
+  validation, memory finalization, and a multi-turn target accumulator for
+  reuse by tool/code AgentLoops with their own state machines.
 - `verl.experimental.agent_loop.trajectory_memory` owns request-ID-keyed
   records and cosine retrieval. The named Ray actor makes one memory visible
   to every agent-loop worker in the job.
@@ -39,21 +44,62 @@ although it may become the memory actor's throughput bottleneck. The hashing
 embedder remains available as an explicitly documented lexical fallback for
 smoke tests only.
 
-The memory lives for the Ray job and has bounded insertion-order eviction.
-`TrajectoryMemoryActor.state_dict()` and `load_state_dict()` are provided for
-external persistence, but trainer checkpoint integration is not automatic.
-When prompt B would exceed the model context, the loop trims the oldest tokens
-from the retrieved trajectory and then its summary while reserving
-`min_response_tokens` for the shared rollout.
+The memory actor is detached and has bounded insertion-order eviction. Set
+`OPSD_MEMORY_OUTPUT` to append each completed training trajectory to a JSONL
+journal, and optionally set `OPSD_MEMORY_SEED` to rebuild memory from a previous
+journal. Trainer checkpoint integration is not automatic.
+
+Prompt A uses the normal verl limits: the initial templated prompt must fit
+`data.max_prompt_length`, the flattened response must fit
+`data.max_response_length`. There is no separate prompt-A total-length setting
+or prompt-A-dependent generation-budget calculation. Each paired request uses
+the `max_new_tokens` supplied in its sampling parameters, defaulting to the
+configured response length when absent. Prompt B is always trimmed to at most
+`MEMORY_PROMPT_MAX_LENGTH`. The launch script defaults
+`max_model_len` to `MEMORY_PROMPT_MAX_LENGTH + MAX_RESPONSE_LENGTH + 1`.
+
+## Reusing the base in a multi-turn AgentLoop
+
+A tool/code AgentLoop keeps its own `run` state machine and calls the base at
+four integration points:
+
+1. Render the initial prompt with `initialize_prompt_a`, then call
+   `initialize_memory_context` once for the complete trajectory identity.
+2. On every model turn, call `generate_paired` with the current full prompt A
+   and that turn's desired `max_new_tokens` in `sampling_params`.
+3. Before appending that model turn, record it in an
+   `OPSDTrajectoryTargetAccumulator` using its final response offset. Tool and
+   environment response tokens are appended normally with `response_mask=0`
+   and are not recorded as model turns; model-generated tool-call tokens remain
+   part of the recorded model turn with `response_mask=1`.
+4. After the state machine terminates, cap the flattened response, call the
+   accumulator's `finalize`, summarize the full model/tool/environment
+   trajectory with `finalize_memory`, and return the tensors in
+   `AgentLoopOutput`.
+
+The accumulator places each sampled distribution at causal-logit position
+`initial_prompt_length - 1 + response_position`. Model positions must have
+`response_mask=1`; tool/environment positions remain zero-filled target rows
+with `response_mask=0`, so the distillation loss ignores them. It returns
+unpadded tensors. The shared AgentLoop postprocessor still left-pads prompts
+and right-pads responses, masks, logprobs, and top-k targets to the configured
+batch widths. Continuous-token loops must provide an exact post-merge position
+mapping; the accumulator fails closed if retokenization changes token IDs.
+For a multi-turn loop, configure `memory_prompt_max_length` above the largest
+current prompt-A context plus prompt-B's fixed template overhead; otherwise the
+base correctly fails once the untrimmable current trajectory no longer fits.
 
 ## Required mix-sglang response contract
 
 The local mix-sglang PDS branch already accepts
-`sampling_params.custom_params` containing:
+`sampling_params.custom_params` containing these fields on both group members:
 
 - `__pds_sample_group`
 - `__pds_fuse_method="avg_probs"`
 - `__pds_fuse_weight`
+
+Only prompt A requests the probability payload used for training:
+
 - `__pds_return_prob_trajectory=true`
 - `__pds_return_top_k=distillation.distillation_loss.topk`
 
@@ -62,8 +108,8 @@ tokenizer manager forwards that batch to the scheduler as one
 `BatchTokenizedGenerateReqInput`, so both PDS members are registered before
 either member can enter deferred sampling.
 
-For every generated position, mix-sglang must return these arrays in
-`meta_info`:
+For every generated position, prompt A's mix-sglang result must return these
+arrays in `meta_info`:
 
 - `pds_source_token_probs`
 - `pds_fused_token_probs`
@@ -72,10 +118,11 @@ For every generated position, mix-sglang must return these arrays in
 
 The first two arrays contain the emitted token's raw probability. Each Top-K
 position is a fixed-width list of `{"token_id": ..., "prob": ...}` entries.
-All four arrays must have the same number of positions as `output_ids`. verl
-converts the raw probabilities to log probabilities before constructing the
-rollout batch; exact zeros become `-inf` and are handled by the configured loss
-clamp.
+All four arrays must have the same number of positions as `output_ids`. Prompt B
+still participates in every forward, fusion, and shared sampling step, but it
+does not duplicate the probability payload. verl converts prompt A's raw
+probabilities to log probabilities before constructing the rollout batch;
+exact zeros become `-inf` and are handled by the configured loss clamp.
 
 `source` means the current request's normalized, post-sampling-filter
 distribution. `fused` means the normalized weighted distribution used to
@@ -102,6 +149,7 @@ paths and resource settings:
 ```bash
 MODEL_PATH=/path/to/model \
 OPSD_EMBEDDING_MODEL=/path/to/semantic-embedding-model \
+MEMORY_PROMPT_MAX_LENGTH=2048 \
 TRAIN_FILES=/path/to/train.parquet \
 VAL_FILES=/path/to/val.parquet \
 bash examples/opsd_memory/run_opsd_memory.sh
@@ -115,3 +163,19 @@ The launch configuration uses supervised `forward_kl_topk` only:
 
 No separate teacher model is started. GPU/NPU execution is still required for
 the actual actor update and mix-sglang rollout.
+
+## Dependency-free flow smoke
+
+On a development machine without PyTorch, Ray, SGLang, or an accelerator, run:
+
+```bash
+python3 examples/opsd_memory/smoke_flow.py
+```
+
+This uses deterministic fake memory and fake generation, but imports the real
+`verl/workers/rollout/logprob_protocol.py` response parser. It verifies the
+complete control/data flow: memory retrieval, prompt-B construction, one A/B
+batch call, source/fused probability parsing, request-ID write-back, causal
+target alignment, batch construction, and target consumption. It does not
+validate model numerics, Ray concurrency, the real mix-sglang scheduler, or an
+actor optimizer step.
