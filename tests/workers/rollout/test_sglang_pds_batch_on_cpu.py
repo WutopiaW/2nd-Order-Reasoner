@@ -48,7 +48,16 @@ async def test_pds_group_uses_one_native_sglang_batch(monkeypatch):
             async def responses():
                 yield [
                     {"output_ids": [7], "meta_info": _pds_meta(0.4)},
-                    {"output_ids": [7], "meta_info": {"finish_reason": {"type": "stop"}}},
+                    {
+                        "output_ids": [7],
+                        "meta_info": {
+                            "finish_reason": {"type": "stop"},
+                            "pds_source_token_probs": [],
+                            "pds_fused_token_probs": [],
+                            "pds_source_top_k": [],
+                            "pds_fused_top_k": [],
+                        },
+                    },
                 ]
 
             return responses()

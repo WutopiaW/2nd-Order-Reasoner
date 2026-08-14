@@ -725,11 +725,13 @@ class SGLangHttpServer:
                 }
             )
 
-        pds_fields = extract_pds_probability_fields(
-            meta_info,
-            output_token_ids=token_ids,
-            expected_topk=context.pds_top_k,
-        )
+        pds_fields = {}
+        if context.pds_return_prob_trajectory or context.pds_top_k is not None:
+            pds_fields = extract_pds_probability_fields(
+                meta_info,
+                output_token_ids=token_ids,
+                expected_topk=context.pds_top_k,
+            )
         if pds_fields:
             extra_fields.update(pds_fields)
             if "fused_log_probs" in pds_fields:
