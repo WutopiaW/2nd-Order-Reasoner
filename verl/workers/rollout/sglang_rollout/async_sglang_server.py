@@ -330,6 +330,7 @@ class SGLangHttpServer:
             "attention_backend": attention_backend,
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
             "skip_server_warmup": True,
+            "disable_overlap_scheduler": True,
             "quantization": quantization,
             "json_model_override_args": json.dumps({"quantization_config": fp8_block_quant_kwargs})
             if quantization == "fp8"
@@ -800,10 +801,26 @@ class SGLangHttpServer:
                 f"SGLang batch generation returned {type(outputs).__name__} with "
                 f"{len(outputs) if isinstance(outputs, list) else 'unknown'} outputs for {len(contexts)} requests."
             )
-        return [
-            self._convert_generate_output(output, context, require_pds_fields=require_pds_fields)
-            for output, context in zip(outputs, contexts, strict=True)
-        ]
+        converted_outputs = []
+        for group_index, (output, context) in enumerate(zip(outputs, contexts, strict=True)):
+            try:
+                converted_outputs.append(
+                    self._convert_generate_output(output, context, require_pds_fields=require_pds_fields)
+                )
+            except ValueError:
+                logger.error(
+                    "SGLang grouped output conversion failed. group_index=%d, request_id=%r, "
+                    "pds_return_prob_trajectory=%r, pds_top_k=%r, sampling_params=%r, "
+                    "raw_group_outputs=%r",
+                    group_index,
+                    context.request_id,
+                    context.pds_return_prob_trajectory,
+                    context.pds_top_k,
+                    [request["sampling_params"] for request in request_dicts],
+                    outputs,
+                )
+                raise
+        return converted_outputs
 
     async def generate(
         self,

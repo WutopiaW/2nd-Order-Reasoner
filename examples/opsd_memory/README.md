@@ -47,7 +47,21 @@ smoke tests only.
 The memory actor is detached and has bounded insertion-order eviction. Set
 `OPSD_MEMORY_OUTPUT` to append each completed training trajectory to a JSONL
 journal, and optionally set `OPSD_MEMORY_SEED` to rebuild memory from a previous
-journal. Trainer checkpoint integration is not automatic.
+journal. Each saved record includes the complete retrieved memory under
+`metadata.retrieved_memory` (request ID, retrieval score, prompt, trajectory,
+and summary), so the experience used to construct prompt B is directly
+auditable. Trainer checkpoint integration is not automatic.
+
+The production embedding model is instantiated lazily inside the named global
+memory actor. AgentLoops are created per trajectory, but they pass the nested
+Hydra embedder config through without constructing the model, avoiding a Qwen3
+embedding-model reload for every sample.
+
+Qwen-style generation may still produce `<think>...</think>` blocks. The full
+rollout tokens remain unchanged for OPSD training and the full trajectory is
+available to the summarization request, but only text outside thinking blocks
+is saved as the memory trajectory and summary. Retrieved seed records are
+cleaned again before prompt B is constructed.
 
 Prompt A uses the normal verl limits: the initial templated prompt must fit
 `data.max_prompt_length`, the flattened response must fit

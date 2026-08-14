@@ -1,5 +1,9 @@
 - name: opsd_memory_agent
   _target_: verl.experimental.agent_loop.opsd_memory_agent_loop.SingleTurnOPSDMemoryAgentLoop
+  # AgentLoops are instantiated once per trajectory. Keep nested objects as
+  # configs so the named global memory actor, rather than every AgentLoop,
+  # constructs the embedding model.
+  _recursive_: false
   target_topk: ${oc.env:OPSD_TARGET_TOPK,32}
   summary_max_tokens: 256
   # Hard cap for the templated prompt B after injecting retrieved memory.

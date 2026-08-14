@@ -233,11 +233,12 @@ class TrajectoryMemoryActor:
         if embedder is None:
             self.embedder: TextEmbedder = HashingTextEmbedder()
         elif callable(getattr(embedder, "encode", None)):
-            # Hydra recursively instantiates nested ``_target_`` values before
-            # constructing the agent loop. Ray then serializes that ready-to-use
-            # embedder into this actor, so it must not be treated as config again.
+            # Preserve compatibility with callers that already constructed an
+            # embedder before creating the actor.
             self.embedder = embedder
         else:
+            # Production AgentLoops pass this nested Hydra config through lazily,
+            # so the global actor constructs the embedding model exactly once.
             embedder_config = OmegaConf.create(embedder)
             self.embedder = hydra.utils.instantiate(embedder_config)
         self.output_path = output_path or None

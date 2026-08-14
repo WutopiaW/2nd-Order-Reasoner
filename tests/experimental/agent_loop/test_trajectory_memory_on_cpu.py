@@ -14,11 +14,13 @@
 
 import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.opsd_memory_base import (
     OPSDMemoryAgentLoopBase,
@@ -26,6 +28,7 @@ from verl.experimental.agent_loop.opsd_memory_base import (
     OPSDPromptPair,
     OPSDTrajectoryTargetAccumulator,
     OPSDTurnOutput,
+    extract_formal_response,
 )
 from verl.experimental.agent_loop.trajectory_memory import (
     HashingTextEmbedder,
@@ -38,6 +41,27 @@ from verl.experimental.agent_loop.trajectory_memory import (
 def test_opsd_base_leaves_run_to_the_concrete_agent_loop():
     assert "run" not in OPSDMemoryAgentLoopBase.__dict__
     assert inspect.isabstract(OPSDMemoryAgentLoopBase)
+
+
+def test_agent_config_defers_embedding_model_construction_to_memory_actor():
+    config_path = Path(__file__).parents[3] / "examples/opsd_memory/agent.yaml"
+    agent_config = OmegaConf.load(config_path)[0]
+
+    assert agent_config._recursive_ is False
+    assert agent_config.memory_embedder._target_.endswith(".HuggingFaceTextEmbedder")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("<think>private reasoning</think>\nFormal answer", "Formal answer"),
+        ("Before\n<think>first</think>\nMiddle\n<THINK>second</THINK>\nAfter", "Before\n\nMiddle\n\nAfter"),
+        ("Formal prefix\n<think>unfinished reasoning", "Formal prefix"),
+        ("Already formal", "Already formal"),
+    ],
+)
+def test_extract_formal_response_removes_qwen_thinking(text, expected):
+    assert extract_formal_response(text) == expected
 
 
 def test_hashing_embedder_prefers_lexically_related_text():
@@ -98,6 +122,93 @@ def test_append_memory_record_writes_readable_jsonl_without_embedding(tmp_path):
         "metadata": {"retrieved_request_id": "request-0", "retrieval_score": 0.75},
         "memory_size": 2,
     }
+
+
+@pytest.mark.asyncio
+async def test_retrieved_memory_is_cleaned_before_prompt_b_uses_it():
+    class SearchMethod:
+        @staticmethod
+        async def remote(prompt, exclude_request_id=None):
+            assert prompt == "current problem"
+            assert exclude_request_id == "request-1"
+            return {
+                "score": 0.75,
+                "record": {
+                    "request_id": "request-0",
+                    "prompt": "related problem",
+                    "trajectory": "<think>old reasoning</think>\nOld final answer",
+                    "summary": "<think>summary reasoning</think>\nReusable lesson",
+                },
+            }
+
+    loop = SimpleNamespace(
+        tokenizer=SimpleNamespace(decode=lambda *args, **kwargs: "current problem"),
+        memory=SimpleNamespace(search=SearchMethod()),
+    )
+    context = await OPSDMemoryAgentLoopBase.initialize_memory_context(
+        loop,
+        [1, 2],
+        request_id="request-1",
+    )
+
+    assert context.memory_prompt == "related problem"
+    assert context.memory_trajectory == "Old final answer"
+    assert context.memory_summary == "Reusable lesson"
+
+
+@pytest.mark.asyncio
+async def test_finalize_memory_saves_formal_text_and_full_retrieved_memory():
+    class UpsertMethod:
+        calls = []
+
+        @classmethod
+        async def remote(cls, **kwargs):
+            cls.calls.append(kwargs)
+
+    async def summarize(**kwargs):
+        assert "private trajectory reasoning" in kwargs["trajectory"]
+        return "<think>private summary reasoning</think>\nReusable formal summary"
+
+    loop = SimpleNamespace(
+        _summarize=summarize,
+        memory=SimpleNamespace(upsert=UpsertMethod()),
+    )
+    context = OPSDMemoryContext(
+        request_id="request-1",
+        prompt_a_text="current problem",
+        retrieved_request_id="request-0",
+        retrieval_score=0.75,
+        memory_prompt="related problem",
+        memory_trajectory="Old final answer",
+        memory_summary="Reusable lesson",
+    )
+
+    summary = await OPSDMemoryAgentLoopBase.finalize_memory(
+        loop,
+        memory_context=context,
+        trajectory="<think>private trajectory reasoning</think>\nCurrent final answer",
+    )
+
+    assert summary == "Reusable formal summary"
+    assert UpsertMethod.calls == [
+        {
+            "request_id": "request-1",
+            "prompt": "current problem",
+            "trajectory": "Current final answer",
+            "summary": "Reusable formal summary",
+            "metadata": {
+                "retrieved_request_id": "request-0",
+                "retrieval_score": 0.75,
+                "retrieved_memory": {
+                    "request_id": "request-0",
+                    "retrieval_score": 0.75,
+                    "prompt": "related problem",
+                    "trajectory": "Old final answer",
+                    "summary": "Reusable lesson",
+                },
+            },
+        }
+    ]
 
 
 def _turn(token_ids, *, first_target_id):

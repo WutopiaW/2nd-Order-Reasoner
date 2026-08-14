@@ -15,12 +15,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 from uuid import uuid4
 
 import ray
 import torch
+from omegaconf import DictConfig, OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase
 from verl.experimental.agent_loop.trajectory_memory import TrajectoryMemoryActor
@@ -58,6 +60,17 @@ PDS_OUTPUT_FIELDS = (
     "fused_log_probs",
 )
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
+_UNCLOSED_THINK_RE = re.compile(r"<think>.*\Z", flags=re.IGNORECASE | re.DOTALL)
+_THINK_TAG_RE = re.compile(r"</?think>", flags=re.IGNORECASE)
+
+
+def extract_formal_response(text: str) -> str:
+    """Return only text outside Qwen-style ``<think>`` blocks."""
+    text = _THINK_BLOCK_RE.sub("", str(text))
+    text = _UNCLOSED_THINK_RE.sub("", text)
+    return _THINK_TAG_RE.sub("", text).strip()
+
 
 @dataclass(frozen=True)
 class OPSDMemoryContext:
@@ -67,6 +80,7 @@ class OPSDMemoryContext:
     prompt_a_text: str
     retrieved_request_id: str | None = None
     retrieval_score: float | None = None
+    memory_prompt: str = ""
     memory_summary: str = ""
     memory_trajectory: str = ""
 
@@ -315,6 +329,8 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
         self.summary_template = summary_template
         self.prompt_a_fuse_weight = float(prompt_a_fuse_weight)
         self.prompt_b_fuse_weight = float(prompt_b_fuse_weight)
+        if isinstance(memory_embedder, DictConfig):
+            memory_embedder = OmegaConf.to_container(memory_embedder, resolve=True)
 
         if memory_actor_name is None:
             job_id = ray.get_runtime_context().get_job_id()
@@ -365,8 +381,9 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
             prompt_a_text=prompt_a_text,
             retrieved_request_id=record["request_id"],
             retrieval_score=retrieved["score"],
-            memory_summary=record["summary"],
-            memory_trajectory=record["trajectory"],
+            memory_prompt=record["prompt"],
+            memory_summary=extract_formal_response(record["summary"]),
+            memory_trajectory=extract_formal_response(record["trajectory"]),
         )
 
     async def initialize_prompt_pair(
@@ -516,24 +533,36 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
         validate: bool = False,
     ) -> str:
         """Summarize the completed full trajectory and write it to global memory."""
-        summary = await self._summarize(
+        generated_summary = await self._summarize(
             request_id=memory_context.request_id,
             prompt_a=memory_context.prompt_a_text,
             trajectory=trajectory,
             priority=int(priority),
         )
+        memory_trajectory = extract_formal_response(trajectory)
+        memory_summary = extract_formal_response(generated_summary)
         if not validate:
+            retrieved_memory = None
+            if memory_context.has_memory:
+                retrieved_memory = {
+                    "request_id": memory_context.retrieved_request_id,
+                    "retrieval_score": memory_context.retrieval_score,
+                    "prompt": memory_context.memory_prompt,
+                    "trajectory": memory_context.memory_trajectory,
+                    "summary": memory_context.memory_summary,
+                }
             await self.memory.upsert.remote(
                 request_id=memory_context.request_id,
                 prompt=memory_context.prompt_a_text,
-                trajectory=trajectory,
-                summary=summary,
+                trajectory=memory_trajectory,
+                summary=memory_summary,
                 metadata={
                     "retrieved_request_id": memory_context.retrieved_request_id,
                     "retrieval_score": memory_context.retrieval_score,
+                    "retrieved_memory": retrieved_memory,
                 },
             )
-        return summary
+        return memory_summary
 
     def _validate_mix_output(self, output: TokenOutput) -> None:
         missing = sorted(set(PDS_OUTPUT_FIELDS).difference(output.extra_fields))

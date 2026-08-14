@@ -25,6 +25,7 @@ from verl.experimental.agent_loop.opsd_memory_base import (
     OPSDTrajectoryTargetAccumulator,
     OPSDTrajectoryTargets,
     OPSDTurnOutput,
+    extract_formal_response,
 )
 from verl.utils.profiler import simple_timer
 
@@ -120,4 +121,5 @@ __all__ = [
     "OPSDTrajectoryTargets",
     "OPSDTurnOutput",
     "SingleTurnOPSDMemoryAgentLoop",
+    "extract_formal_response",
 ]
