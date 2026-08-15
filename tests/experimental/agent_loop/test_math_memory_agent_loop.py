@@ -16,7 +16,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from verl.experimental.agent_loop.opsd_memory_base import OPSDMemoryAgentLoopBase, OPSDMemoryContext
+from verl.experimental.agent_loop.opsd_memory_base import (
+    OPSDMemoryAgentLoopBase,
+    OPSDMemoryContext,
+    OPSDPromptPair,
+)
 from verl.experimental.math_memory_agent.agent_loop import MathOPSDMemoryAgentLoop, normalize_math_ground_truth
 
 
@@ -46,6 +50,36 @@ def test_summary_template_depends_on_verifier_outcome():
 
     assert loop._summary_template_for_outcome(True) == "success summary"
     assert loop._summary_template_for_outcome(False) == "failure summary"
+
+
+def test_paired_trajectory_messages_preserve_thinking_and_actual_prompt_b():
+    raw_prompt = [
+        {"role": "system", "content": "Solve carefully."},
+        {"role": "user", "content": "What is 1 + 1?"},
+    ]
+    pair = OPSDPromptPair(
+        prompt_a_ids=[1, 2],
+        prompt_b_ids=[3, 4],
+        max_new_tokens=32,
+        prompt_b_text="Use this trimmed memory, then solve 1 + 1.",
+    )
+
+    trajectory_a, trajectory_b = MathOPSDMemoryAgentLoop._build_paired_trajectory_messages(
+        raw_prompt,
+        pair,
+        "<think>One plus one is two.</think>\\boxed{2}",
+    )
+
+    assert trajectory_a == [
+        {"role": "system", "content": "Solve carefully."},
+        {"role": "user", "content": "What is 1 + 1?"},
+        {"role": "assistant", "content": "<think>One plus one is two.</think>\\boxed{2}"},
+    ]
+    assert trajectory_b == [
+        {"role": "user", "content": "Use this trimmed memory, then solve 1 + 1."},
+        {"role": "assistant", "content": "<think>One plus one is two.</think>\\boxed{2}"},
+    ]
+    assert raw_prompt[-1]["content"] == "What is 1 + 1?"
 
 
 @pytest.mark.asyncio
@@ -92,10 +126,26 @@ async def test_finalize_memory_preserves_raw_trajectory_and_summary():
     summary = await loop.finalize_memory(
         memory_context=context,
         trajectory="  <think>solution reasoning</think>\\boxed{1}  ",
+        trajectory_a=[
+            {"role": "user", "content": "problem"},
+            {"role": "assistant", "content": "<think>A reasoning</think>\\boxed{1}"},
+        ],
+        trajectory_b=[
+            {"role": "user", "content": "memory plus problem"},
+            {"role": "assistant", "content": "<think>B reasoning</think>\\boxed{1}"},
+        ],
+        ground_truth="1",
+        verifier_score=1.0,
+        answer_correct=True,
     )
 
     assert captured["trajectory"] == "<think>solution reasoning</think>\\boxed{1}"
     assert captured["summary"] == "<think>summary reasoning</think>final summary"
+    assert captured["trajectory_a"][-1]["content"] == "<think>A reasoning</think>\\boxed{1}"
+    assert captured["trajectory_b"][-1]["content"] == "<think>B reasoning</think>\\boxed{1}"
+    assert captured["ground_truth"] == "1"
+    assert captured["metadata"]["math_verifier_score"] == 1.0
+    assert captured["metadata"]["math_answer_correct"] is True
     assert summary == captured["summary"]
 
 

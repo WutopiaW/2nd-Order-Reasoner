@@ -96,6 +96,9 @@ class OPSDPromptPair:
     prompt_a_ids: list[int]
     prompt_b_ids: list[int]
     max_new_tokens: int
+    # Exact post-budget user content used to render prompt B. ``None`` means
+    # there was no retrieved memory and B reused prompt A unchanged.
+    prompt_b_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -395,11 +398,12 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
     ) -> OPSDPromptPair:
         """Build A/B using the caller-specified shared generation length."""
         prompt_a_ids = list(prompt_a_ids)
+        prompt_b_text = None
         if not memory_context.has_memory:
             prompt_b_ids = list(prompt_a_ids)
         else:
             current_prompt_a = self.tokenizer.decode(prompt_a_ids, skip_special_tokens=True)
-            _, prompt_b_ids = await self._render_prompt_with_budget(
+            prompt_b_text, prompt_b_ids = await self._render_prompt_with_budget(
                 template=self.prompt_b_template,
                 fields={
                     "prompt_a": current_prompt_a,
@@ -413,6 +417,7 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
             prompt_a_ids=prompt_a_ids,
             prompt_b_ids=prompt_b_ids,
             max_new_tokens=int(max_new_tokens),
+            prompt_b_text=prompt_b_text,
         )
 
     async def generate_paired(

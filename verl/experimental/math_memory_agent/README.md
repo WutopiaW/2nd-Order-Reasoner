@@ -21,6 +21,14 @@ B keep their configured chat-template behavior. This recipe stores and retrieves
 the trajectory and summary as generated; unlike the generic OPSD loop, it does
 not post-process memory text with `extract_formal_response()`.
 
+Each JSONL memory record also contains `trajectory_a` and `trajectory_b` as full
+chat-message lists, plus the normalized verifier `ground_truth`. The assistant
+message in both trajectories is decoded with special tokens retained, so Qwen
+thinking tags and their contents remain available for auditing. When memory is
+used, `trajectory_b` records the exact prompt-B text after token-budget trimming,
+not a reconstruction from the untrimmed template. The legacy string
+`trajectory` field remains available for retrieval and backward compatibility.
+
 Configure the rollout with:
 
 ```bash

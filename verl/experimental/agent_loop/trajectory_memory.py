@@ -19,6 +19,8 @@ import hashlib
 import json
 import re
 from collections import OrderedDict
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -109,6 +111,29 @@ class TrajectoryRecord:
     summary: str
     embedding: list[float] | np.ndarray
     metadata: dict[str, Any] = field(default_factory=dict)
+    trajectory_a: list[dict[str, Any]] | None = None
+    trajectory_b: list[dict[str, Any]] | None = None
+    ground_truth: str | None = None
+
+
+def _copy_message_list(
+    messages: list[dict[str, Any]] | None,
+    *,
+    field_name: str,
+) -> list[dict[str, Any]] | None:
+    """Validate and detach an optional OpenAI-style message history."""
+    if messages is None:
+        return None
+    if not isinstance(messages, list):
+        raise TypeError(f"{field_name} must be a list of messages, got {type(messages).__name__}.")
+    copied = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise TypeError(f"{field_name}[{index}] must be a mapping, got {type(message).__name__}.")
+        if "role" not in message or "content" not in message:
+            raise ValueError(f"{field_name}[{index}] must contain role and content fields.")
+        copied.append(deepcopy(dict(message)))
+    return copied
 
 
 class TrajectoryMemory:
@@ -135,6 +160,9 @@ class TrajectoryMemory:
             summary=record.summary,
             embedding=embedding.copy(),
             metadata=dict(record.metadata),
+            trajectory_a=_copy_message_list(record.trajectory_a, field_name="trajectory_a"),
+            trajectory_b=_copy_message_list(record.trajectory_b, field_name="trajectory_b"),
+            ground_truth=record.ground_truth,
         )
         self._records.pop(record.request_id, None)
         self._records[record.request_id] = normalized_record
@@ -210,6 +238,9 @@ def append_memory_record(path: str | Path, record: TrajectoryRecord, *, memory_s
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(record)
     payload.pop("embedding", None)
+    for optional_field in ("trajectory_a", "trajectory_b", "ground_truth"):
+        if payload[optional_field] is None:
+            payload.pop(optional_field)
     payload["memory_size"] = memory_size
     with output_path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n")
@@ -257,6 +288,17 @@ class TrajectoryMemoryActor:
                             summary=str(payload["summary"]),
                             embedding=self.embedder.encode(str(payload["prompt"])),
                             metadata=dict(payload.get("metadata") or {}),
+                            trajectory_a=_copy_message_list(
+                                payload.get("trajectory_a"), field_name="trajectory_a"
+                            ),
+                            trajectory_b=_copy_message_list(
+                                payload.get("trajectory_b"), field_name="trajectory_b"
+                            ),
+                            ground_truth=(
+                                str(payload["ground_truth"])
+                                if payload.get("ground_truth") is not None
+                                else None
+                            ),
                         )
                     except (KeyError, TypeError, ValueError) as error:
                         raise ValueError(f"Invalid memory seed record at {seed_file}:{line_number}") from error
@@ -276,6 +318,9 @@ class TrajectoryMemoryActor:
         trajectory: str,
         summary: str,
         metadata: dict[str, Any] | None = None,
+        trajectory_a: list[dict[str, Any]] | None = None,
+        trajectory_b: list[dict[str, Any]] | None = None,
+        ground_truth: str | None = None,
     ) -> None:
         record = TrajectoryRecord(
             request_id=request_id,
@@ -284,6 +329,9 @@ class TrajectoryMemoryActor:
             summary=summary,
             embedding=self.embedder.encode(prompt),
             metadata=metadata or {},
+            trajectory_a=trajectory_a,
+            trajectory_b=trajectory_b,
+            ground_truth=ground_truth,
         )
         self.memory.upsert(record)
         if self.output_path is not None:

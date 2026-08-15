@@ -89,13 +89,27 @@ def test_memory_is_keyed_by_request_id_and_evicts_oldest_record():
 
 def test_memory_state_round_trip_and_dimension_validation():
     memory = TrajectoryMemory(capacity=3)
-    memory.upsert(TrajectoryRecord("r1", "p1", "t1", "s1", [3.0, 4.0]))
+    memory.upsert(
+        TrajectoryRecord(
+            "r1",
+            "p1",
+            "t1",
+            "s1",
+            [3.0, 4.0],
+            trajectory_a=[{"role": "user", "content": "p1"}],
+            trajectory_b=[{"role": "user", "content": "memory + p1"}],
+            ground_truth="1",
+        )
+    )
 
     restored = TrajectoryMemory(capacity=1)
     restored.load_state_dict(memory.state_dict())
 
     assert restored.capacity == 3
     np.testing.assert_allclose(restored.get("r1").embedding, [0.6, 0.8])
+    assert restored.get("r1").trajectory_a == [{"role": "user", "content": "p1"}]
+    assert restored.get("r1").trajectory_b == [{"role": "user", "content": "memory + p1"}]
+    assert restored.get("r1").ground_truth == "1"
     with pytest.raises(ValueError, match="dimension"):
         restored.search([1.0, 0.0, 0.0])
 
@@ -122,6 +136,29 @@ def test_append_memory_record_writes_readable_jsonl_without_embedding(tmp_path):
         "metadata": {"retrieved_request_id": "request-0", "retrieval_score": 0.75},
         "memory_size": 2,
     }
+
+
+def test_append_math_memory_record_writes_paired_messages_and_ground_truth(tmp_path):
+    output_path = tmp_path / "math-trajectories.jsonl"
+    assistant = {"role": "assistant", "content": "<think>reasoning</think>\\boxed{2}"}
+    record = TrajectoryRecord(
+        request_id="request-1",
+        prompt="What is 1 + 1?",
+        trajectory="<think>reasoning</think>\\boxed{2}",
+        summary="You answered correctly.",
+        embedding=[1.0, 0.0],
+        trajectory_a=[{"role": "user", "content": "What is 1 + 1?"}, assistant],
+        trajectory_b=[{"role": "user", "content": "Use memory, then solve."}, assistant],
+        ground_truth="2",
+    )
+
+    append_memory_record(output_path, record, memory_size=1)
+
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+    assert saved["trajectory_a"][-1]["content"] == "<think>reasoning</think>\\boxed{2}"
+    assert saved["trajectory_b"][0] == {"role": "user", "content": "Use memory, then solve."}
+    assert saved["ground_truth"] == "2"
+    assert "embedding" not in saved
 
 
 @pytest.mark.asyncio
@@ -276,6 +313,7 @@ async def test_prompt_pair_uses_explicit_max_new_tokens_without_prompt_a_budget_
     assert pair.prompt_a_ids == prompt_a_ids
     assert pair.prompt_b_ids == prompt_a_ids
     assert pair.max_new_tokens == 777
+    assert pair.prompt_b_text is None
 
 
 @pytest.mark.asyncio
@@ -319,6 +357,8 @@ async def test_prompt_b_is_trimmed_to_explicit_memory_prompt_cap():
     loop = SimpleNamespace(
         tokenizer=WhitespaceTokenizer(),
         apply_chat_template=apply_chat_template,
+        prompt_b_template="{prompt_a} {memory_trajectory} {memory_summary}",
+        memory_prompt_max_length=512,
     )
     prompt_a = " ".join(["a"] * 128)
     memory_trajectory = " ".join(["trajectory"] * 1800)
@@ -339,3 +379,19 @@ async def test_prompt_b_is_trimmed_to_explicit_memory_prompt_cap():
     assert len(prompt_b_ids) <= 512
     assert len(prompt_b_ids) > 128
     assert cap_prompt_length_values and all(value is False for value in cap_prompt_length_values)
+
+    pair = await OPSDMemoryAgentLoopBase.initialize_prompt_pair(
+        loop,
+        prompt_a_ids=prompt_a.split(),
+        memory_context=OPSDMemoryContext(
+            request_id="request-1",
+            prompt_a_text=prompt_a,
+            retrieved_request_id="request-0",
+            memory_trajectory=memory_trajectory,
+            memory_summary=memory_summary,
+        ),
+        max_new_tokens=64,
+    )
+    assert pair.prompt_b_text is not None
+    assert pair.prompt_b_ids == pair.prompt_b_text.split()
+    assert len(pair.prompt_b_ids) <= 512

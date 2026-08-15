@@ -16,12 +16,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from functools import partial
 from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
-from verl.experimental.agent_loop.opsd_memory_base import OPSDMemoryAgentLoopBase, OPSDMemoryContext
+from verl.experimental.agent_loop.opsd_memory_base import (
+    OPSDMemoryAgentLoopBase,
+    OPSDMemoryContext,
+    OPSDPromptPair,
+)
 from verl.utils.profiler import simple_timer
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
 
@@ -142,6 +147,24 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
     def _summary_template_for_outcome(self, answer_correct: bool) -> str:
         return self.success_summary_template if answer_correct else self.failure_summary_template
 
+    @staticmethod
+    def _build_paired_trajectory_messages(
+        raw_prompt: Sequence[Mapping[str, Any]],
+        prompt_pair: OPSDPromptPair,
+        assistant_content: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Build auditable A/B message histories from the actual rollout contexts."""
+        trajectory_a = [deepcopy(dict(message)) for message in raw_prompt]
+        if prompt_pair.prompt_b_text is None:
+            trajectory_b = deepcopy(trajectory_a)
+        else:
+            trajectory_b = [{"role": "user", "content": prompt_pair.prompt_b_text}]
+
+        assistant_message = {"role": "assistant", "content": str(assistant_content)}
+        trajectory_a.append(deepcopy(assistant_message))
+        trajectory_b.append(deepcopy(assistant_message))
+        return trajectory_a, trajectory_b
+
     async def initialize_memory_context(
         self,
         prompt_a_ids: Sequence[int],
@@ -195,6 +218,11 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         *,
         memory_context: OPSDMemoryContext,
         trajectory: str,
+        trajectory_a: list[dict[str, Any]],
+        trajectory_b: list[dict[str, Any]],
+        ground_truth: str,
+        verifier_score: float,
+        answer_correct: bool,
         priority: int = 0,
         validate: bool = False,
     ) -> str:
@@ -222,10 +250,15 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 prompt=memory_context.prompt_a_text,
                 trajectory=memory_trajectory,
                 summary=memory_summary,
+                trajectory_a=trajectory_a,
+                trajectory_b=trajectory_b,
+                ground_truth=ground_truth,
                 metadata={
                     "retrieved_request_id": memory_context.retrieved_request_id,
                     "retrieval_score": memory_context.retrieval_score,
                     "retrieved_memory": retrieved_memory,
+                    "math_verifier_score": verifier_score,
+                    "math_answer_correct": answer_correct,
                 },
             )
         return memory_summary
@@ -264,6 +297,12 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         targets = accumulator.finalize(response_ids=response_ids, response_mask=response_mask)
 
         trajectory = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+        complete_trajectory = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+        trajectory_a, trajectory_b = self._build_paired_trajectory_messages(
+            messages,
+            turn_output.prompt_pair,
+            complete_trajectory,
+        )
         with simple_timer("math_verify", metrics):
             verifier_score = await self._verify_trajectory(trajectory, ground_truth)
         answer_correct = verifier_score >= self.correctness_threshold
@@ -277,6 +316,11 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
             summary = await self.finalize_memory(
                 memory_context=memory_context,
                 trajectory=trajectory,
+                trajectory_a=trajectory_a,
+                trajectory_b=trajectory_b,
+                ground_truth=ground_truth,
+                verifier_score=verifier_score,
+                answer_correct=answer_correct,
                 priority=int(priority),
                 validate=__validate__,
             )
