@@ -52,6 +52,28 @@ def test_summary_template_depends_on_verifier_outcome():
     assert loop._summary_template_for_outcome(False) == "failure summary"
 
 
+def test_problem_text_uses_original_user_message_without_template_markers():
+    messages = [
+        {"role": "system", "content": "Answer carefully."},
+        {"role": "user", "content": "  What is 1 + 1?  "},
+    ]
+
+    assert MathOPSDMemoryAgentLoop._problem_text_from_messages(messages) == "What is 1 + 1?"
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "system", "content": "No user message."}],
+        [{"role": "user", "content": "   "}],
+        [{"role": "user", "content": ["not", "text"]}],
+    ],
+)
+def test_problem_text_rejects_missing_or_non_text_user_message(messages):
+    with pytest.raises(ValueError, match="user message"):
+        MathOPSDMemoryAgentLoop._problem_text_from_messages(messages)
+
+
 def test_paired_trajectory_messages_preserve_thinking_and_actual_prompt_b():
     raw_prompt = [
         {"role": "system", "content": "Solve carefully."},
@@ -79,6 +101,8 @@ def test_paired_trajectory_messages_preserve_thinking_and_actual_prompt_b():
         {"role": "user", "content": "Use this trimmed memory, then solve 1 + 1."},
         {"role": "assistant", "content": "<think>One plus one is two.</think>\\boxed{2}"},
     ]
+    assert "<|im_end|>" not in trajectory_a[-1]["content"]
+    assert "<|im_end|>" not in trajectory_b[-1]["content"]
     assert raw_prompt[-1]["content"] == "What is 1 + 1?"
 
 
@@ -150,7 +174,7 @@ async def test_finalize_memory_preserves_raw_trajectory_and_summary():
 
 
 @pytest.mark.asyncio
-async def test_memory_retrieval_preserves_raw_thinking_blocks():
+async def test_memory_retrieval_removes_trajectory_thinking_before_prompt_b():
     class FakeSearch:
         async def remote(self, *args, **kwargs):
             return {
@@ -171,5 +195,5 @@ async def test_memory_retrieval_preserves_raw_thinking_blocks():
         query_text="current problem",
     )
 
-    assert context.memory_trajectory == "<think>previous reasoning</think>\\boxed{2}"
+    assert context.memory_trajectory == "\\boxed{2}"
     assert context.memory_summary == "<think>unexpected summary thinking</think>lesson"

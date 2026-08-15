@@ -26,6 +26,7 @@ from verl.experimental.agent_loop.opsd_memory_base import (
     OPSDMemoryAgentLoopBase,
     OPSDMemoryContext,
     OPSDPromptPair,
+    extract_formal_response,
 )
 from verl.utils.profiler import simple_timer
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
@@ -148,6 +149,18 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         return self.success_summary_template if answer_correct else self.failure_summary_template
 
     @staticmethod
+    def _problem_text_from_messages(messages: Sequence[Mapping[str, Any]]) -> str:
+        """Return the original current math problem without chat-template markers."""
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("MathOPSDMemoryAgentLoop requires a non-empty text user message.")
+            return content.strip()
+        raise ValueError("MathOPSDMemoryAgentLoop requires raw_prompt to contain a user message.")
+
+    @staticmethod
     def _build_paired_trajectory_messages(
         raw_prompt: Sequence[Mapping[str, Any]],
         prompt_pair: OPSDPromptPair,
@@ -172,7 +185,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         request_id: str | None = None,
         query_text: str | None = None,
     ) -> OPSDMemoryContext:
-        """Retrieve raw memory text without stripping Qwen thinking blocks."""
+        """Retrieve memory while excluding prior private reasoning from prompt B."""
         request_id = request_id or uuid4().hex
         prompt_a_text = query_text or self.tokenizer.decode(list(prompt_a_ids), skip_special_tokens=True)
         retrieved = await self.memory.search.remote(prompt_a_text, exclude_request_id=request_id)
@@ -186,7 +199,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
             retrieval_score=retrieved["score"],
             memory_prompt=record["prompt"],
             memory_summary=str(record["summary"]).strip(),
-            memory_trajectory=str(record["trajectory"]).strip(),
+            memory_trajectory=extract_formal_response(record["trajectory"]),
         )
 
     async def _summarize(
@@ -277,7 +290,8 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
             raise NotImplementedError("MathOPSDMemoryAgentLoop currently supports text-only prompts.")
 
         prompt_a_ids = await self.initialize_prompt_a(messages)
-        memory_context = await self.initialize_memory_context(prompt_a_ids)
+        problem_text = self._problem_text_from_messages(messages)
+        memory_context = await self.initialize_memory_context(prompt_a_ids, query_text=problem_text)
 
         metrics: dict[str, float] = {}
         with simple_timer("generate_sequences", metrics):
@@ -297,11 +311,10 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         targets = accumulator.finalize(response_ids=response_ids, response_mask=response_mask)
 
         trajectory = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        complete_trajectory = self.tokenizer.decode(response_ids, skip_special_tokens=False)
         trajectory_a, trajectory_b = self._build_paired_trajectory_messages(
             messages,
             turn_output.prompt_pair,
-            complete_trajectory,
+            trajectory,
         )
         with simple_timer("math_verify", metrics):
             verifier_score = await self._verify_trajectory(trajectory, ground_truth)

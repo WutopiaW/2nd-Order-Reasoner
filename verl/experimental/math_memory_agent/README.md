@@ -17,17 +17,20 @@ answer that Math-Verify can extract. A missing/malformed answer, verifier error,
 or verifier timeout is treated as incorrect.
 
 The no-thinking setting applies only to summary generation. Prompt A and prompt
-B keep their configured chat-template behavior. This recipe stores and retrieves
-the trajectory and summary as generated; unlike the generic OPSD loop, it does
-not post-process memory text with `extract_formal_response()`.
+B keep their configured chat-template behavior. The recipe stores the complete
+trajectory, including Qwen thinking, for auditing. When a record is retrieved to
+construct prompt B, `extract_formal_response()` removes the prior trajectory's
+`<think>...</think>` block so only its concise formal response is reused.
 
 Each JSONL memory record also contains `trajectory_a` and `trajectory_b` as full
 chat-message lists, plus the normalized verifier `ground_truth`. The assistant
-message in both trajectories is decoded with special tokens retained, so Qwen
-thinking tags and their contents remain available for auditing. When memory is
-used, `trajectory_b` records the exact prompt-B text after token-budget trimming,
-not a reconstruction from the untrimmed template. The legacy string
-`trajectory` field remains available for retrieval and backward compatibility.
+message in both trajectories retains Qwen thinking tags and their contents while
+omitting chat-template control tokens such as `<|im_end|>`. Prompt retrieval uses
+the original user-message text. The `Current problem` section of prompt B uses
+the decoded prompt A, intentionally preserving its rendered `user` and
+`assistant` role markers. When memory is used, `trajectory_b` records the exact
+prompt-B text after token-budget trimming. The legacy string `trajectory` field
+remains available for retrieval and backward compatibility.
 
 Configure the rollout with:
 

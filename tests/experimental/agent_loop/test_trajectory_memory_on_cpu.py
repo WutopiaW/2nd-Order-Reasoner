@@ -395,3 +395,44 @@ async def test_prompt_b_is_trimmed_to_explicit_memory_prompt_cap():
     assert pair.prompt_b_text is not None
     assert pair.prompt_b_ids == pair.prompt_b_text.split()
     assert len(pair.prompt_b_ids) <= 512
+
+
+@pytest.mark.asyncio
+async def test_prompt_b_preserves_decoded_prompt_a_role_markers():
+    class NestedTemplateTokenizer:
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=True):
+            del token_ids, skip_special_tokens
+            return "user nested problem assistant"
+
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            del add_special_tokens
+            return text.split()
+
+    async def apply_chat_template(messages, cap_prompt_length=True):
+        del cap_prompt_length
+        return messages[0]["content"].split()
+
+    loop = SimpleNamespace(
+        tokenizer=NestedTemplateTokenizer(),
+        apply_chat_template=apply_chat_template,
+        prompt_b_template="Current problem: {prompt_a} Memory: {memory_summary} {memory_trajectory}",
+        memory_prompt_max_length=128,
+    )
+    pair = await OPSDMemoryAgentLoopBase.initialize_prompt_pair(
+        loop,
+        prompt_a_ids=[1, 2, 3],
+        memory_context=OPSDMemoryContext(
+            request_id="request-1",
+            prompt_a_text="clean problem text",
+            retrieved_request_id="request-0",
+            memory_summary="summary",
+            memory_trajectory="trajectory",
+        ),
+        max_new_tokens=32,
+    )
+
+    assert pair.prompt_b_text is not None
+    assert "Current problem: user nested problem assistant" in pair.prompt_b_text
+    assert "Current problem: clean problem text" not in pair.prompt_b_text
