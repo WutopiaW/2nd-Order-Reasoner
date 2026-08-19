@@ -56,6 +56,20 @@ Incorrect trajectory:
 {trajectory}
 """
 
+TRUNCATED_SUMMARY_TEMPLATE = """The math response below was truncated because it reached the generation
+length limit and may be incomplete.
+Do not characterize the answer as correct or incorrect.
+Summarize any reusable partial progress: the approach taken, useful intermediate insights, and the point where
+the solution became incomplete. Explain what steps or checks are still needed to finish the solution reliably.
+Do not invent missing reasoning or a final answer. Be concise.
+
+Problem:
+{prompt_a}
+
+Truncated trajectory:
+{trajectory}
+"""
+
 
 def normalize_math_ground_truth(value: Any) -> str:
     """Normalize one dataset ground truth to the unboxed form expected by Math-Verify."""
@@ -93,13 +107,14 @@ def normalize_math_ground_truth(value: Any) -> str:
 
 
 class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
-    """One-shot math OPSD loop whose memory summary depends on answer correctness."""
+    """One-shot math OPSD loop with outcome-aware memory summaries."""
 
     def __init__(
         self,
         *args,
         success_summary_template: str = SUCCESS_SUMMARY_TEMPLATE,
         failure_summary_template: str = FAILURE_SUMMARY_TEMPLATE,
+        truncated_summary_template: str = TRUNCATED_SUMMARY_TEMPLATE,
         math_verifier_timeout: float = 30.0,
         correctness_threshold: float = 1.0,
         **kwargs,
@@ -107,10 +122,18 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         super().__init__(*args, **kwargs)
         self.success_summary_template = str(success_summary_template)
         self.failure_summary_template = str(failure_summary_template)
+        self.truncated_summary_template = str(truncated_summary_template)
         self.math_verifier_timeout = float(math_verifier_timeout)
         self.correctness_threshold = float(correctness_threshold)
-        if not self.success_summary_template.strip() or not self.failure_summary_template.strip():
-            raise ValueError("Both math summary templates must be non-empty.")
+        if not all(
+            template.strip()
+            for template in (
+                self.success_summary_template,
+                self.failure_summary_template,
+                self.truncated_summary_template,
+            )
+        ):
+            raise ValueError("The success, failure, and truncated math summary templates must be non-empty.")
         if self.math_verifier_timeout <= 0:
             raise ValueError(f"math_verifier_timeout must be positive, got {self.math_verifier_timeout}.")
         if not 0 < self.correctness_threshold <= 1:
@@ -145,8 +168,26 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         )
         return float(score)
 
-    def _summary_template_for_outcome(self, answer_correct: bool) -> str:
+    @staticmethod
+    def _summary_outcome(*, answer_correct: bool, response_truncated: bool) -> str:
+        if response_truncated:
+            return "truncated"
+        return "correct" if answer_correct else "incorrect"
+
+    def _summary_template_for_outcome(
+        self,
+        answer_correct: bool,
+        *,
+        response_truncated: bool = False,
+    ) -> str:
+        if response_truncated:
+            return self.truncated_summary_template
         return self.success_summary_template if answer_correct else self.failure_summary_template
+
+    @staticmethod
+    def _response_was_truncated(turn_output: OPSDTurnOutput, *, response_limit: int) -> bool:
+        """Detect backend length stops and the loop's own final response cap."""
+        return turn_output.stop_reason == "length" or len(turn_output.token_ids) > int(response_limit)
 
     @staticmethod
     def _problem_text_from_messages(messages: Sequence[Mapping[str, Any]]) -> str:
@@ -236,6 +277,9 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         ground_truth: str,
         verifier_score: float,
         answer_correct: bool,
+        response_truncated: bool,
+        summary_outcome: str,
+        rollout_stop_reason: str | None,
         priority: int = 0,
         validate: bool = False,
     ) -> str:
@@ -272,6 +316,9 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                     "retrieved_memory": retrieved_memory,
                     "math_verifier_score": verifier_score,
                     "math_answer_correct": answer_correct,
+                    "math_response_truncated": response_truncated,
+                    "math_summary_outcome": summary_outcome,
+                    "rollout_stop_reason": rollout_stop_reason,
                 },
             )
         return memory_summary
@@ -302,7 +349,9 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 priority=int(priority),
             )
 
-        response_ids = turn_output.token_ids[: self.rollout_config.response_length]
+        response_limit = int(self.rollout_config.response_length)
+        response_truncated = self._response_was_truncated(turn_output, response_limit=response_limit)
+        response_ids = turn_output.token_ids[:response_limit]
         if not response_ids:
             raise RuntimeError("Math OPSD rollout produced no model tokens to verify or distill.")
         response_mask = [1] * len(response_ids)
@@ -319,12 +368,19 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         with simple_timer("math_verify", metrics):
             verifier_score = await self._verify_trajectory(trajectory, ground_truth)
         answer_correct = verifier_score >= self.correctness_threshold
+        summary_outcome = self._summary_outcome(
+            answer_correct=answer_correct,
+            response_truncated=response_truncated,
+        )
 
         # AgentLoopManager creates one loop instance per trajectory. Selecting
         # the template here keeps the reusable OPSD finalization and memory
         # write-back path unchanged while making this recipe outcome-aware.
         previous_summary_template = self.summary_template
-        self.summary_template = self._summary_template_for_outcome(answer_correct)
+        self.summary_template = self._summary_template_for_outcome(
+            answer_correct,
+            response_truncated=response_truncated,
+        )
         try:
             summary = await self.finalize_memory(
                 memory_context=memory_context,
@@ -334,6 +390,9 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 ground_truth=ground_truth,
                 verifier_score=verifier_score,
                 answer_correct=answer_correct,
+                response_truncated=response_truncated,
+                summary_outcome=summary_outcome,
+                rollout_stop_reason=turn_output.stop_reason,
                 priority=int(priority),
                 validate=__validate__,
             )
@@ -351,6 +410,9 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 "trajectory_summary": summary,
                 "math_verifier_score": verifier_score,
                 "math_answer_correct": answer_correct,
+                "math_response_truncated": response_truncated,
+                "math_summary_outcome": summary_outcome,
+                "rollout_stop_reason": turn_output.stop_reason,
                 "math_verifier_seconds": metrics["math_verify"],
                 "turn_scores": [],
                 "tool_rewards": [],
@@ -381,5 +443,6 @@ __all__ = [
     "FAILURE_SUMMARY_TEMPLATE",
     "MathOPSDMemoryAgentLoop",
     "SUCCESS_SUMMARY_TEMPLATE",
+    "TRUNCATED_SUMMARY_TEMPLATE",
     "normalize_math_ground_truth",
 ]

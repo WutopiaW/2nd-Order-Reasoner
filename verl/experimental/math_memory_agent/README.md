@@ -7,14 +7,19 @@ rollouts. It preserves the normal OPSD flow:
 2. build prompt B from that memory;
 3. run one synchronized A/B mix-sglang generation;
 4. verify the completed trajectory with Math-Verify;
-5. select a success or failure summary prompt, render it in Qwen's
+5. classify the response as truncated, correct, or incorrect, then select the
+   corresponding summary prompt and render it in Qwen's
    `enable_thinking=False` mode, and write the summary back;
 6. return prompt A's aligned source/fused targets for rollout distillation.
 
 The dataset must provide an unboxed or boxed scalar answer at
 `reward_model.ground_truth`. The model response must contain a final boxed
-answer that Math-Verify can extract. A missing/malformed answer, verifier error,
-or verifier timeout is treated as incorrect.
+answer that Math-Verify can extract. A response stopped by the generation length
+limit receives a neutral summary that captures useful partial progress without
+calling the answer correct or incorrect. For non-truncated responses, a
+missing/malformed answer, verifier error, or verifier timeout is treated as
+incorrect. The verifier still runs for truncated responses so its raw result
+remains available for auditing.
 
 The no-thinking setting applies only to summary generation. Prompt A and prompt
 B keep their configured chat-template behavior. The recipe stores the complete
@@ -44,6 +49,9 @@ are the same as `examples/opsd_memory/run_opsd_memory.sh`. In particular,
 `distillation.target_source=rollout` and `forward_kl_topk` consume the fused
 targets returned by this loop.
 
-Each output exposes `math_verifier_score`, `math_answer_correct`, and
-`math_verifier_seconds` in `extra_fields`. Validation rollouts still run the
-verifier and summary generation, but they do not update global memory.
+Each output exposes `math_verifier_score`, `math_answer_correct`,
+`math_response_truncated`, `math_summary_outcome`, `rollout_stop_reason`, and
+`math_verifier_seconds` in `extra_fields`. `math_answer_correct` is the raw
+verifier classification, while `math_summary_outcome` records which of the
+three summary prompts was used. Validation rollouts still run the verifier and
+summary generation, but they do not update global memory.

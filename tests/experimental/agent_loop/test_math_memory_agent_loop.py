@@ -47,9 +47,32 @@ def test_summary_template_depends_on_verifier_outcome():
     loop = object.__new__(MathOPSDMemoryAgentLoop)
     loop.success_summary_template = "success summary"
     loop.failure_summary_template = "failure summary"
+    loop.truncated_summary_template = "truncated summary"
 
     assert loop._summary_template_for_outcome(True) == "success summary"
     assert loop._summary_template_for_outcome(False) == "failure summary"
+    assert loop._summary_template_for_outcome(True, response_truncated=True) == "truncated summary"
+    assert loop._summary_template_for_outcome(False, response_truncated=True) == "truncated summary"
+    assert loop._summary_outcome(answer_correct=True, response_truncated=False) == "correct"
+    assert loop._summary_outcome(answer_correct=False, response_truncated=False) == "incorrect"
+    assert loop._summary_outcome(answer_correct=True, response_truncated=True) == "truncated"
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "token_count", "response_limit", "expected"),
+    [
+        ("length", 3, 8, True),
+        ("stop", 9, 8, True),
+        ("stop", 8, 8, False),
+        (None, 3, 8, False),
+    ],
+)
+def test_response_truncation_covers_backend_and_local_caps(stop_reason, token_count, response_limit, expected):
+    turn_output = SimpleNamespace(stop_reason=stop_reason, token_ids=list(range(token_count)))
+
+    assert (
+        MathOPSDMemoryAgentLoop._response_was_truncated(turn_output, response_limit=response_limit) is expected
+    )
 
 
 def test_problem_text_uses_original_user_message_without_template_markers():
@@ -117,13 +140,14 @@ async def test_summary_uses_qwen_no_thinking_without_posthoc_extraction(monkeypa
             "custom_flag": "kept",
             "enable_thinking": False,
         }
+        assert kwargs["trajectory"] == "<think>reasoning remains in the summary input</think>answer"
         return "<think>unexpected but preserved</think>summary"
 
     monkeypatch.setattr(OPSDMemoryAgentLoopBase, "_summarize", fake_base_summarize)
     summary = await loop._summarize(
         request_id="request-1",
         prompt_a="problem",
-        trajectory="trajectory",
+        trajectory="<think>reasoning remains in the summary input</think>answer",
         priority=0,
     )
 
@@ -161,6 +185,9 @@ async def test_finalize_memory_preserves_raw_trajectory_and_summary():
         ground_truth="1",
         verifier_score=1.0,
         answer_correct=True,
+        response_truncated=False,
+        summary_outcome="correct",
+        rollout_stop_reason="stop",
     )
 
     assert captured["trajectory"] == "<think>solution reasoning</think>\\boxed{1}"
@@ -170,6 +197,9 @@ async def test_finalize_memory_preserves_raw_trajectory_and_summary():
     assert captured["ground_truth"] == "1"
     assert captured["metadata"]["math_verifier_score"] == 1.0
     assert captured["metadata"]["math_answer_correct"] is True
+    assert captured["metadata"]["math_response_truncated"] is False
+    assert captured["metadata"]["math_summary_outcome"] == "correct"
+    assert captured["metadata"]["rollout_stop_reason"] == "stop"
     assert summary == captured["summary"]
 
 
