@@ -33,9 +33,11 @@ message in both trajectories retains Qwen thinking tags and their contents while
 omitting chat-template control tokens such as `<|im_end|>`. Prompt retrieval uses
 the original user-message text. The `Current problem` section of prompt B uses
 the decoded prompt A, intentionally preserving its rendered `user` and
-`assistant` role markers. When memory is used, `trajectory_b` records the exact
-prompt-B text after token-budget trimming. The legacy string `trajectory` field
-remains available for retrieval and backward compatibility.
+`assistant` role markers. Prompt B also includes the retrieved record's original
+problem so its summary and formal trajectory remain grounded. When memory is
+used, `trajectory_b` records the exact prompt-B text after token-budget trimming.
+The legacy string `trajectory` field remains available for retrieval and
+backward compatibility.
 
 Configure the rollout with:
 

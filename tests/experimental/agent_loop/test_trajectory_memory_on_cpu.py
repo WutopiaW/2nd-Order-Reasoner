@@ -357,23 +357,26 @@ async def test_prompt_b_is_trimmed_to_explicit_memory_prompt_cap():
     loop = SimpleNamespace(
         tokenizer=WhitespaceTokenizer(),
         apply_chat_template=apply_chat_template,
-        prompt_b_template="{prompt_a} {memory_trajectory} {memory_summary}",
+        prompt_b_template="{prompt_a} {memory_prompt} {memory_trajectory} {memory_summary}",
         memory_prompt_max_length=512,
     )
     prompt_a = " ".join(["a"] * 128)
+    memory_prompt = "related historical problem"
     memory_trajectory = " ".join(["trajectory"] * 1800)
     memory_summary = " ".join(["summary"] * 120)
 
     _, prompt_b_ids = await OPSDMemoryAgentLoopBase._render_prompt_with_budget(
         loop,
-        template="{prompt_a} {memory_trajectory} {memory_summary}",
+        template="{prompt_a} {memory_prompt} {memory_trajectory} {memory_summary}",
         fields={
             "prompt_a": prompt_a,
+            "memory_prompt": memory_prompt,
             "memory_trajectory": memory_trajectory,
             "memory_summary": memory_summary,
         },
-        trim_order=("memory_trajectory", "memory_summary"),
+        trim_order=("memory_trajectory", "memory_summary", "memory_prompt"),
         max_prompt_tokens=512,
+        trim_sides={"memory_prompt": "right"},
     )
 
     assert len(prompt_b_ids) <= 512
@@ -387,6 +390,7 @@ async def test_prompt_b_is_trimmed_to_explicit_memory_prompt_cap():
             request_id="request-1",
             prompt_a_text=prompt_a,
             retrieved_request_id="request-0",
+            memory_prompt=memory_prompt,
             memory_trajectory=memory_trajectory,
             memory_summary=memory_summary,
         ),
@@ -395,6 +399,46 @@ async def test_prompt_b_is_trimmed_to_explicit_memory_prompt_cap():
     assert pair.prompt_b_text is not None
     assert pair.prompt_b_ids == pair.prompt_b_text.split()
     assert len(pair.prompt_b_ids) <= 512
+    assert memory_prompt in pair.prompt_b_text
+
+
+@pytest.mark.asyncio
+async def test_prompt_b_trims_previous_problem_from_right_after_other_memory_fields():
+    class WhitespaceTokenizer:
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            del add_special_tokens
+            return text.split()
+
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=True):
+            del skip_special_tokens
+            return " ".join(token_ids)
+
+    async def apply_chat_template(messages, cap_prompt_length=True):
+        del cap_prompt_length
+        return messages[0]["content"].split()
+
+    loop = SimpleNamespace(tokenizer=WhitespaceTokenizer(), apply_chat_template=apply_chat_template)
+    prompt_b_text, prompt_b_ids = await OPSDMemoryAgentLoopBase._render_prompt_with_budget(
+        loop,
+        template="{prompt_a} {memory_trajectory} {memory_summary} {memory_prompt}",
+        fields={
+            "prompt_a": "current",
+            "memory_trajectory": "trajectory-start trajectory-end",
+            "memory_summary": "summary-start summary-end",
+            "memory_prompt": " ".join(f"problem-{index}" for index in range(10)),
+        },
+        trim_order=("memory_trajectory", "memory_summary", "memory_prompt"),
+        max_prompt_tokens=10,
+        trim_sides={"memory_prompt": "right"},
+    )
+
+    assert len(prompt_b_ids) <= 10
+    assert "trajectory-start" not in prompt_b_text
+    assert "summary-start" not in prompt_b_text
+    assert "problem-0" in prompt_b_text
+    assert "problem-9" not in prompt_b_text
 
 
 @pytest.mark.asyncio

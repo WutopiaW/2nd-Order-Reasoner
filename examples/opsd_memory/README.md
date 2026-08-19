@@ -4,7 +4,8 @@ This example implements a rollout-driven variant of on-policy self-distillation:
 
 1. Search a Ray-owned global trajectory memory for the record most similar to
    prompt A.
-2. Render prompt B from prompt A plus the retrieved trajectory and summary.
+2. Render prompt B from prompt A plus the retrieved problem, trajectory, and
+   summary.
 3. Send A and B to one mix-sglang replica in a single native batch as a
    two-member PDS sample group.
 4. Sample a shared trajectory from the weighted mixture of the two next-token
@@ -71,6 +72,10 @@ the `max_new_tokens` supplied in its sampling parameters, defaulting to the
 configured response length when absent. Prompt B is always trimmed to at most
 `MEMORY_PROMPT_MAX_LENGTH`. The launch script defaults
 `max_model_len` to `MEMORY_PROMPT_MAX_LENGTH + MAX_RESPONSE_LENGTH + 1`.
+When prompt B exceeds its cap, it trims the retrieved trajectory first, then
+the retrieved summary, and finally the retrieved problem while preserving the
+current problem. Trajectory and summary trimming keeps their suffixes; retrieved
+problem trimming keeps its prefix so the original setup and conditions survive.
 
 ## Reusing the base in a multi-turn AgentLoop
 

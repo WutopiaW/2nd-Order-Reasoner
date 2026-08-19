@@ -30,6 +30,9 @@ from verl.workers.rollout.replica import TokenOutput
 
 DEFAULT_PROMPT_B_TEMPLATE = """A previous attempt on a semantically related problem is provided below.
 
+Previous problem:
+{memory_prompt}
+
 Previous summary:
 {memory_summary}
 
@@ -407,10 +410,12 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
                 template=self.prompt_b_template,
                 fields={
                     "prompt_a": current_prompt_a,
+                    "memory_prompt": memory_context.memory_prompt,
                     "memory_summary": memory_context.memory_summary,
                     "memory_trajectory": memory_context.memory_trajectory,
                 },
-                trim_order=("memory_trajectory", "memory_summary"),
+                trim_order=("memory_trajectory", "memory_summary", "memory_prompt"),
+                trim_sides={"memory_prompt": "right"},
                 max_prompt_tokens=self.memory_prompt_max_length,
             )
         return OPSDPromptPair(
@@ -645,11 +650,18 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
         fields: dict[str, str],
         trim_order: tuple[str, ...],
         max_prompt_tokens: int,
+        trim_sides: dict[str, str] | None = None,
     ) -> tuple[str, list[int]]:
-        """Render and left-trim selected variable fields to a hard token cap."""
+        """Render and trim selected variable fields to a hard token cap."""
         if max_prompt_tokens <= 0:
             raise ValueError(f"Prompt token budget must be positive, got {max_prompt_tokens}.")
         fields = dict(fields)
+        trim_sides = dict(trim_sides or {})
+        invalid_trim_sides = {
+            field_name: side for field_name, side in trim_sides.items() if side not in {"left", "right"}
+        }
+        if invalid_trim_sides:
+            raise ValueError(f"Prompt trim sides must be 'left' or 'right', got {invalid_trim_sides}.")
 
         async def render() -> tuple[str, list[int]]:
             text = template.format(**fields)
@@ -668,8 +680,12 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
                     break
                 overflow = len(prompt_ids) - max_prompt_tokens
                 remove_count = min(len(field_ids), overflow + 8)
+                if trim_sides.get(field_name, "left") == "right":
+                    retained_ids = field_ids[: len(field_ids) - remove_count]
+                else:
+                    retained_ids = field_ids[remove_count:]
                 fields[field_name] = self.tokenizer.decode(
-                    field_ids[remove_count:],
+                    retained_ids,
                     skip_special_tokens=True,
                 )
                 text, prompt_ids = await render()

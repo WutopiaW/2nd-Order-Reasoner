@@ -124,6 +124,7 @@ def build_prompt_b(prompt_a: str, memory: MemoryRecord | None) -> str:
     if memory is None:
         return prompt_a
     return (
+        f"Previous problem: {memory.prompt}\n"
         f"Previous summary: {memory.summary}\n"
         f"Previous trajectory: {memory.trajectory}\n"
         f"Current problem: {prompt_a}"
@@ -253,6 +254,7 @@ def main() -> None:
     assert first["retrieved_request_id"] is None
     assert first["prompt_b"] == first["prompt_a"]
     assert second["retrieved_request_id"] == "request-1"
+    assert f"Previous problem: {first['prompt_a']}" in second["prompt_b"]
     assert "Previous summary:" in second["prompt_b"]
     assert set(memory.records) == {"request-1", "request-2"}
     assert engine.batch_calls == 2
