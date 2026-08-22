@@ -133,9 +133,13 @@ def compute_distillation_loss_range(
 ) -> dict[str, Metric]:
     """Compute min and max distillation loss over valid response tokens."""
     if response_mask.is_nested:
-        distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
+        response_mask = response_mask.bool().to_padded_tensor(False)
     else:
-        distillation_losses_response = distillation_losses[response_mask.bool()]
+        response_mask = response_mask.bool()
+    # An all-zero correctness mask still logs the unselected token statistics;
+    # the scalar loss itself is forced to zero below.
+    metric_mask = response_mask if response_mask.any() else torch.ones_like(response_mask)
+    distillation_losses_response = distillation_losses[metric_mask]
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
@@ -308,12 +312,17 @@ def distillation_loss(
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
-        distillation_loss = agg_loss(
-            loss_mat=distillation_losses,
-            loss_mask=response_mask,
-            loss_agg_mode=loss_agg_mode,
-            **config.global_batch_info,
-        )
+        if response_mask.bool().any():
+            distillation_loss = agg_loss(
+                loss_mat=distillation_losses,
+                loss_mask=response_mask,
+                loss_agg_mode=loss_agg_mode,
+                **config.global_batch_info,
+            )
+        else:
+            # Preserve a graph-connected scalar so an all-incorrect micro-batch
+            # can execute backward without dividing by zero.
+            distillation_loss = (distillation_losses * 0.0).sum()
 
     return distillation_loss, distillation_metrics
 
@@ -345,18 +354,19 @@ def compute_forward_kl_topk(
     else:
         response_mask_bool = data["response_mask"].bool()
     assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+    metric_mask = response_mask_bool if response_mask_bool.any() else torch.ones_like(response_mask_bool)
 
     overlap_metrics = {}
     if overlap_count is not None and overlap_token_advantage is not None:
         assert overlap_count.shape == overlap_token_advantage.shape == response_mask_bool.shape
-        valid_overlap_count = overlap_count[response_mask_bool]
+        valid_overlap_count = overlap_count[metric_mask]
         k = distillation_config.distillation_loss.topk
         assert k is not None
         # Diagnostics for tracking teacher/student top-k overlap in OPD, following
         # "Rethinking On-Policy Distillation of Large Language Models" (arXiv:2604.13016):
         # overlap ratio and average teacher-token KL contribution on overlapped tokens.
         overlap_metrics["distillation/overlap_ratio"] = (valid_overlap_count.float().mean() / k).item()
-        overlap_position_mask = response_mask_bool & (overlap_count > 0)
+        overlap_position_mask = metric_mask & (overlap_count > 0)
         if overlap_position_mask.any():
             overlap_metrics["distillation/overlap_token_advantage"] = (
                 overlap_token_advantage[overlap_position_mask].mean().item()
@@ -365,8 +375,8 @@ def compute_forward_kl_topk(
             overlap_metrics["distillation/overlap_token_advantage"] = 0.0
 
     # Log amount of mass in the top-k log probabilities for both student and teacher.
-    student_mass = student_mass[response_mask_bool]
-    teacher_mass = teacher_mass[response_mask_bool]
+    student_mass = student_mass[metric_mask]
+    teacher_mass = teacher_mass[metric_mask]
     distillation_metrics = {
         "distillation/student_mass": student_mass.mean().item(),
         "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass.min()),

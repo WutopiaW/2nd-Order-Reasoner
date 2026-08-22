@@ -329,7 +329,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         priority: int = 0,
         __validate__: bool = False,
         **kwargs,
-    ) -> AgentLoopOutput:
+    ) -> AgentLoopOutput | list[AgentLoopOutput]:
         messages = list(kwargs["raw_prompt"])
         ground_truth = self._ground_truth_from_sample(kwargs)
         multi_modal_data = await self.process_multi_modal_info(messages)
@@ -368,6 +368,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         with simple_timer("math_verify", metrics):
             verifier_score = await self._verify_trajectory(trajectory, ground_truth)
         answer_correct = verifier_score >= self.correctness_threshold
+        training_response_mask = response_mask if (__validate__ or answer_correct) else [0] * len(response_mask)
         summary_outcome = self._summary_outcome(
             answer_correct=answer_correct,
             response_truncated=response_truncated,
@@ -399,29 +400,33 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         finally:
             self.summary_template = previous_summary_template
 
-        extra_fields = dict(accumulator.extra_fields)
-        extra_fields.update(
+        shared_extra_fields = {
+            "memory_request_id": memory_context.request_id,
+            "retrieved_memory_request_id": memory_context.retrieved_request_id,
+            "memory_retrieval_score": memory_context.retrieval_score,
+            "trajectory_summary": summary,
+            "math_verifier_score": verifier_score,
+            "math_answer_correct": answer_correct,
+            "math_response_truncated": response_truncated,
+            "math_summary_outcome": summary_outcome,
+            "rollout_stop_reason": turn_output.stop_reason,
+            "math_verifier_seconds": metrics["math_verify"],
+            "turn_scores": [],
+            "tool_rewards": [],
+        }
+        extra_fields_a = dict(accumulator.extra_fields)
+        extra_fields_a.update(
             {
                 "teacher_ids": targets.fused_topk_ids,
                 "teacher_logprobs": targets.fused_topk_logprobs,
-                "memory_request_id": memory_context.request_id,
-                "retrieved_memory_request_id": memory_context.retrieved_request_id,
-                "memory_retrieval_score": memory_context.retrieval_score,
-                "trajectory_summary": summary,
-                "math_verifier_score": verifier_score,
-                "math_answer_correct": answer_correct,
-                "math_response_truncated": response_truncated,
-                "math_summary_outcome": summary_outcome,
-                "rollout_stop_reason": turn_output.stop_reason,
-                "math_verifier_seconds": metrics["math_verify"],
-                "turn_scores": [],
-                "tool_rewards": [],
+                "distillation_prompt_variant": "A",
+                **shared_extra_fields,
             }
         )
-        return AgentLoopOutput(
+        output_a = AgentLoopOutput(
             prompt_ids=prompt_a_ids,
             response_ids=response_ids,
-            response_mask=response_mask,
+            response_mask=training_response_mask,
             response_logprobs=targets.response_logprobs,
             source_topk_ids=targets.source_topk_ids,
             source_topk_logprobs=targets.source_topk_logprobs,
@@ -435,8 +440,44 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 compute_score=metrics["math_verify"],
                 num_preempted=accumulator.num_preempted,
             ),
-            extra_fields=extra_fields,
+            extra_fields=extra_fields_a,
         )
+
+        # With no retrieved memory B is exactly A, so returning it again would
+        # only double this sample's weight. Validation also keeps A as the sole
+        # output so reward and reporting semantics remain unchanged.
+        if __validate__ or not memory_context.has_memory:
+            return output_a
+
+        accumulator_b = self.new_target_accumulator(turn_output.prompt_pair.prompt_b_ids)
+        accumulator_b.record_model_turn(turn_output, response_start=0)
+        targets_b = accumulator_b.finalize(response_ids=response_ids, response_mask=response_mask)
+        extra_fields_b = dict(accumulator_b.extra_fields)
+        extra_fields_b.update(
+            {
+                "teacher_ids": targets_b.fused_topk_ids,
+                "teacher_logprobs": targets_b.fused_topk_logprobs,
+                "distillation_prompt_variant": "B",
+                **shared_extra_fields,
+            }
+        )
+        output_b = AgentLoopOutput(
+            prompt_ids=turn_output.prompt_pair.prompt_b_ids,
+            response_ids=response_ids,
+            response_mask=training_response_mask,
+            response_logprobs=targets_b.response_logprobs,
+            fused_topk_ids=targets_b.fused_topk_ids,
+            fused_topk_logprobs=targets_b.fused_topk_logprobs,
+            multi_modal_data={},
+            num_turns=2,
+            metrics=AgentLoopMetrics(),
+            extra_fields=extra_fields_b,
+        )
+
+        # V1 treats the last item as the session's final output for reward,
+        # advantage, and reporting. Keep A last to preserve the existing
+        # non-privileged evaluation semantics while training on both contexts.
+        return [output_b, output_a]
 
 
 __all__ = [

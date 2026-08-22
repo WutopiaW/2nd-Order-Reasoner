@@ -10,7 +10,7 @@ rollouts. It preserves the normal OPSD flow:
 5. classify the response as truncated, correct, or incorrect, then select the
    corresponding summary prompt and render it in Qwen's
    `enable_thinking=False` mode, and write the summary back;
-6. return prompt A's aligned source/fused targets for rollout distillation.
+6. return aligned fused targets for both prompt A and prompt B during training.
 
 The dataset must provide an unboxed or boxed scalar answer at
 `reward_model.ground_truth`. The model response must contain a final boxed
@@ -56,4 +56,13 @@ Each output exposes `math_verifier_score`, `math_answer_correct`,
 `math_verifier_seconds` in `extra_fields`. `math_answer_correct` is the raw
 verifier classification, while `math_summary_outcome` records which of the
 three summary prompts was used. Validation rollouts still run the verifier and
-summary generation, but they do not update global memory.
+summary generation, but they do not update global memory. During training, an
+incorrect trajectory returns an all-zero `response_mask`, so it contributes no
+direct distillation gradient; verification, summary generation, and memory
+write-back still run for both outcomes. When a memory was retrieved, each
+correct training rollout produces two distillation samples: one conditioned on
+prompt A and one on prompt B, both supervised by the same fused distribution.
+Prompt B targets are independently aligned to prompt B's token length. If no
+memory was retrieved, prompt B is identical to prompt A and is not duplicated.
+Validation keeps the original response mask and returns only prompt A, because
+it does not perform a training update.
