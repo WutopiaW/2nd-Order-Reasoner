@@ -170,9 +170,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         )
 
         if final_output.reward_score is not None:
+            reward_extra_info = final_output.extra_fields.get("reward_extra_info")
             for output in outputs[:-1]:
                 output.reward_score = final_output.reward_score
-                output.extra_fields["reward_extra_info"] = final_output.extra_fields["reward_extra_info"]
+                if reward_extra_info is not None:
+                    output.extra_fields["reward_extra_info"] = reward_extra_info
 
         # NOTE: agent loop may has multiple outputs, put each output into TransferQueue.
         # key format: {uid}_{session_id}_{index}
