@@ -31,43 +31,97 @@ from verl.experimental.agent_loop.opsd_memory_base import (
 from verl.utils.profiler import simple_timer
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
 
+MATH_PROMPT_B_TEMPLATE = r"""You are solving the current math problem. A potentially relevant experience
+summarized from a different problem and a reference solution for the current problem are provided as privileged
+context.
+
+Current problem:
+=== Current Problem Begin ===
+{prompt_a}
+=== Current Problem End ===
+
+Reference solution for the current problem:
+=== Reference Solution Begin ===
+{reference_solution}
+=== Reference Solution End ===
+
+Retrieved related problem:
+=== Retrieved Problem Begin ===
+{memory_prompt}
+=== Retrieved Problem End ===
+
+Summary of the retrieved experience:
+=== Retrieved Summary Begin ===
+{memory_summary}
+=== Retrieved Summary End ===
+
+Instructions:
+
+1. Determine internally which general strategies or warnings from the retrieved experience apply to the current
+   problem.
+2. The retrieved experience may be only partially relevant and is not guaranteed to be correct. Verify every
+   transferred insight.
+3. Any statement that the previous attempt was correct, incorrect, or truncated applies only to the retrieved
+   problem.
+4. Do not infer or reuse the retrieved problem's final answer.
+5. The reference solution belongs to the current problem. Use it as training-time guidance, but verify its steps
+   and do not merely copy it.
+6. Solve the current problem independently and completely using your own reasoning.
+7. Explore alternative approaches, check intermediate results, and backtrack or reconsider when necessary.
+8. Do not shorten the solution merely because the retrieved summary or reference solution is concise.
+9. Put the final answer within \boxed{{}}.
+
+Now solve the current problem."""
+
 SUCCESS_SUMMARY_TEMPLATE = """The completed math trajectory has been verified as correct.
 Tell the solver clearly: "You answered correctly."
-Then summarize the reusable successful experience: the key reasoning strategy, decisive intermediate insights,
-and checks that made the solution reliable. Be concise and do not merely repeat the trajectory.
+Compare the completed trajectory with the reference solution, then summarize the reusable successful experience:
+the key reasoning strategy, decisive intermediate insights, and checks that made the solution reliable. Mention
+meaningful alternative reasoning when the two solutions differ. Be concise and do not merely repeat either text.
 
 Problem:
 {prompt_a}
 
 Correct trajectory:
 {trajectory}
+
+Reference solution:
+{reference_solution}
 """
 
 FAILURE_SUMMARY_TEMPLATE = """The completed math trajectory has been verified as incorrect.
 Tell the solver clearly: "Your answer is incorrect."
-Then summarize the reusable lessons from the failure: identify likely reasoning, calculation, or verification
-mistakes and explain what should be checked or changed next time. Do not present an uncertain step as correct.
-Be concise and do not merely repeat the trajectory.
+Compare the attempted trajectory with the reference solution. Identify the first meaningful divergence, including
+reasoning, calculation, or verification mistakes, and explain what should be checked or changed next time.
+Summarize the correct reusable strategy without merely copying the reference solution. Do not present an uncertain
+step as correct. Be concise.
 
 Problem:
 {prompt_a}
 
 Incorrect trajectory:
 {trajectory}
+
+Reference solution:
+{reference_solution}
 """
 
 TRUNCATED_SUMMARY_TEMPLATE = """The math response below was truncated because it reached the generation
 length limit and may be incomplete.
 Do not characterize the answer as correct or incorrect.
-Summarize any reusable partial progress: the approach taken, useful intermediate insights, and the point where
-the solution became incomplete. Explain what steps or checks are still needed to finish the solution reliably.
-Do not invent missing reasoning or a final answer. Be concise.
+Compare only the completed portion with the reference solution. Summarize any reusable partial progress: the
+approach taken, useful intermediate insights, and the point where the solution became incomplete. Explain what
+steps or checks are still needed to finish the solution reliably. Do not claim that reference-only steps were
+already produced by the solver. Do not invent missing reasoning or a final answer. Be concise.
 
 Problem:
 {prompt_a}
 
 Truncated trajectory:
 {trajectory}
+
+Reference solution:
+{reference_solution}
 """
 
 
@@ -119,6 +173,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         correctness_threshold: float = 1.0,
         **kwargs,
     ):
+        kwargs.setdefault("prompt_b_template", MATH_PROMPT_B_TEMPLATE)
         super().__init__(*args, **kwargs)
         self.success_summary_template = str(success_summary_template)
         self.failure_summary_template = str(failure_summary_template)
@@ -150,6 +205,26 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 "reward_model mapping with a ground_truth field."
             )
         return normalize_math_ground_truth(reward_model.get("ground_truth"))
+
+    @staticmethod
+    def _reference_solution_from_sample(kwargs: Mapping[str, Any], *, required: bool) -> str:
+        extra_info = kwargs.get("extra_info")
+        if not isinstance(extra_info, Mapping):
+            if required:
+                raise ValueError(
+                    "MathOPSDMemoryAgentLoop requires each training row to contain an "
+                    "extra_info mapping with a solution field."
+                )
+            return ""
+        solution = extra_info.get("solution")
+        if not isinstance(solution, str) or not solution.strip():
+            if required:
+                raise ValueError(
+                    "MathOPSDMemoryAgentLoop requires each training row to contain a non-empty "
+                    "extra_info.solution string."
+                )
+            return ""
+        return solution.strip()
 
     async def _verify_trajectory(self, trajectory: str, ground_truth: str) -> float:
         # The shared scorer runs Math-Verify in a bounded subprocess. Calling it
@@ -219,6 +294,11 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         trajectory_b.append(deepcopy(assistant_message))
         return trajectory_a, trajectory_b
 
+    @staticmethod
+    def _should_distill_prompt_b(prompt_pair: OPSDPromptPair, *, validate: bool) -> bool:
+        """Return B only when it is a distinct training context."""
+        return not validate and prompt_pair.prompt_b_text is not None
+
     async def initialize_memory_context(
         self,
         prompt_a_ids: Sequence[int],
@@ -249,6 +329,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         request_id: str,
         prompt_a: str,
         trajectory: str,
+        reference_solution: str,
         priority: int,
     ) -> str:
         """Generate the memory summary with Qwen thinking disabled."""
@@ -263,6 +344,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 prompt_a=prompt_a,
                 trajectory=trajectory,
                 priority=priority,
+                summary_extra_fields={"reference_solution": reference_solution},
             )
         finally:
             self.apply_chat_template_kwargs = previous_template_kwargs
@@ -275,6 +357,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         trajectory_a: list[dict[str, Any]],
         trajectory_b: list[dict[str, Any]],
         ground_truth: str,
+        reference_solution: str,
         verifier_score: float,
         answer_correct: bool,
         response_truncated: bool,
@@ -288,6 +371,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
             request_id=memory_context.request_id,
             prompt_a=memory_context.prompt_a_text,
             trajectory=trajectory,
+            reference_solution=reference_solution,
             priority=int(priority),
         )
         memory_trajectory = str(trajectory).strip()
@@ -332,6 +416,8 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
     ) -> AgentLoopOutput | list[AgentLoopOutput]:
         messages = list(kwargs["raw_prompt"])
         ground_truth = self._ground_truth_from_sample(kwargs)
+        reference_solution = self._reference_solution_from_sample(kwargs, required=not __validate__)
+        prompt_b_reference_solution = "" if __validate__ else reference_solution
         multi_modal_data = await self.process_multi_modal_info(messages)
         if multi_modal_data:
             raise NotImplementedError("MathOPSDMemoryAgentLoop currently supports text-only prompts.")
@@ -347,6 +433,8 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 memory_context=memory_context,
                 sampling_params=sampling_params,
                 priority=int(priority),
+                prompt_b_extra_fields={"reference_solution": prompt_b_reference_solution},
+                force_prompt_b=bool(prompt_b_reference_solution),
             )
 
         response_limit = int(self.rollout_config.response_length)
@@ -389,6 +477,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 trajectory_a=trajectory_a,
                 trajectory_b=trajectory_b,
                 ground_truth=ground_truth,
+                reference_solution=reference_solution,
                 verifier_score=verifier_score,
                 answer_correct=answer_correct,
                 response_truncated=response_truncated,
@@ -443,10 +532,10 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
             extra_fields=extra_fields_a,
         )
 
-        # With no retrieved memory B is exactly A, so returning it again would
-        # only double this sample's weight. Validation also keeps A as the sole
-        # output so reward and reporting semantics remain unchanged.
-        if __validate__ or not memory_context.has_memory:
+        # Validation keeps A as the sole output so reward and reporting semantics
+        # remain unchanged. A missing prompt-B text means B reused A exactly, so
+        # returning it again would only double this sample's training weight.
+        if not self._should_distill_prompt_b(turn_output.prompt_pair, validate=__validate__):
             return output_a
 
         accumulator_b = self.new_target_accumulator(turn_output.prompt_pair.prompt_b_ids)
@@ -482,6 +571,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
 
 __all__ = [
     "FAILURE_SUMMARY_TEMPLATE",
+    "MATH_PROMPT_B_TEMPLATE",
     "MathOPSDMemoryAgentLoop",
     "SUCCESS_SUMMARY_TEMPLATE",
     "TRUNCATED_SUMMARY_TEMPLATE",

@@ -21,7 +21,14 @@ from verl.experimental.agent_loop.opsd_memory_base import (
     OPSDMemoryContext,
     OPSDPromptPair,
 )
-from verl.experimental.math_memory_agent.agent_loop import MathOPSDMemoryAgentLoop, normalize_math_ground_truth
+from verl.experimental.math_memory_agent.agent_loop import (
+    FAILURE_SUMMARY_TEMPLATE,
+    MATH_PROMPT_B_TEMPLATE,
+    SUCCESS_SUMMARY_TEMPLATE,
+    TRUNCATED_SUMMARY_TEMPLATE,
+    MathOPSDMemoryAgentLoop,
+    normalize_math_ground_truth,
+)
 
 
 @pytest.mark.parametrize(
@@ -41,6 +48,99 @@ def test_normalize_math_ground_truth(value, expected):
 def test_normalize_math_ground_truth_rejects_unsupported_values(value):
     with pytest.raises((TypeError, ValueError)):
         normalize_math_ground_truth(value)
+
+
+def test_reference_solution_is_loaded_from_extra_info():
+    kwargs = {"extra_info": {"solution": "  reference reasoning  "}}
+
+    assert (
+        MathOPSDMemoryAgentLoop._reference_solution_from_sample(kwargs, required=True)
+        == "reference reasoning"
+    )
+
+
+@pytest.mark.parametrize("extra_info", [None, {}, {"solution": None}, {"solution": "   "}])
+def test_reference_solution_fails_closed_for_training(extra_info):
+    with pytest.raises(ValueError, match="extra_info"):
+        MathOPSDMemoryAgentLoop._reference_solution_from_sample(
+            {"extra_info": extra_info},
+            required=True,
+        )
+
+
+def test_reference_solution_is_optional_for_validation():
+    assert MathOPSDMemoryAgentLoop._reference_solution_from_sample({}, required=False) == ""
+
+
+def test_math_templates_accept_reference_solution():
+    fields = {
+        "prompt_a": "problem",
+        "trajectory": "attempt",
+        "reference_solution": "reference",
+        "memory_prompt": "previous problem",
+        "memory_summary": "previous summary",
+        "memory_trajectory": "previous trajectory",
+    }
+
+    for template in (SUCCESS_SUMMARY_TEMPLATE, FAILURE_SUMMARY_TEMPLATE, TRUNCATED_SUMMARY_TEMPLATE):
+        rendered = template.format(**fields)
+        assert "Reference solution:\nreference" in rendered
+    prompt_b = MATH_PROMPT_B_TEMPLATE.format(**fields)
+    assert "=== Current Problem Begin ===\nproblem\n=== Current Problem End ===" in prompt_b
+    assert "=== Reference Solution Begin ===\nreference\n=== Reference Solution End ===" in prompt_b
+    assert "=== Retrieved Problem Begin ===\nprevious problem\n=== Retrieved Problem End ===" in prompt_b
+    assert "=== Retrieved Summary Begin ===\nprevious summary\n=== Retrieved Summary End ===" in prompt_b
+    assert "previous trajectory" not in prompt_b
+    assert r"Put the final answer within \boxed{}." in prompt_b
+
+
+@pytest.mark.asyncio
+async def test_prompt_b_can_be_forced_with_reference_solution_before_memory_warmup():
+    class WhitespaceTokenizer:
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            del add_special_tokens
+            return text.split()
+
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=True):
+            del skip_special_tokens
+            return " ".join(token_ids)
+
+    async def apply_chat_template(messages, cap_prompt_length=True):
+        assert cap_prompt_length is False
+        return messages[0]["content"].split()
+
+    loop = SimpleNamespace(
+        tokenizer=WhitespaceTokenizer(),
+        apply_chat_template=apply_chat_template,
+        prompt_b_template=MATH_PROMPT_B_TEMPLATE,
+        memory_prompt_max_length=512,
+    )
+    pair = await OPSDMemoryAgentLoopBase.initialize_prompt_pair(
+        loop,
+        prompt_a_ids=["current", "problem"],
+        memory_context=OPSDMemoryContext(request_id="request-1", prompt_a_text="current problem"),
+        max_new_tokens=32,
+        prompt_b_extra_fields={"reference_solution": "gold reasoning and answer"},
+        force_prompt_b=True,
+    )
+
+    assert pair.prompt_b_text is not None
+    assert "gold reasoning and answer" in pair.prompt_b_text
+    assert pair.prompt_b_ids != pair.prompt_a_ids
+
+
+def test_solution_conditioned_prompt_b_remains_a_training_sample():
+    prompt_pair = OPSDPromptPair(
+        prompt_a_ids=[1, 2],
+        prompt_b_ids=[3, 4, 5],
+        max_new_tokens=32,
+        prompt_b_text="problem plus reference solution",
+    )
+
+    assert MathOPSDMemoryAgentLoop._should_distill_prompt_b(prompt_pair, validate=False)
+    assert not MathOPSDMemoryAgentLoop._should_distill_prompt_b(prompt_pair, validate=True)
 
 
 def test_summary_template_depends_on_verifier_outcome():
@@ -141,6 +241,7 @@ async def test_summary_uses_qwen_no_thinking_without_posthoc_extraction(monkeypa
             "enable_thinking": False,
         }
         assert kwargs["trajectory"] == "<think>reasoning remains in the summary input</think>answer"
+        assert kwargs["summary_extra_fields"] == {"reference_solution": "reference reasoning"}
         return "<think>unexpected but preserved</think>summary"
 
     monkeypatch.setattr(OPSDMemoryAgentLoopBase, "_summarize", fake_base_summarize)
@@ -148,6 +249,7 @@ async def test_summary_uses_qwen_no_thinking_without_posthoc_extraction(monkeypa
         request_id="request-1",
         prompt_a="problem",
         trajectory="<think>reasoning remains in the summary input</think>answer",
+        reference_solution="reference reasoning",
         priority=0,
     )
 
@@ -183,6 +285,7 @@ async def test_finalize_memory_preserves_raw_trajectory_and_summary():
             {"role": "assistant", "content": "<think>B reasoning</think>\\boxed{1}"},
         ],
         ground_truth="1",
+        reference_solution="reference reasoning and answer",
         verifier_score=1.0,
         answer_correct=True,
         response_truncated=False,

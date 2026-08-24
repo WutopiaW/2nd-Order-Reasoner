@@ -16,8 +16,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 from uuid import uuid4
 
 import ray
@@ -99,8 +100,8 @@ class OPSDPromptPair:
     prompt_a_ids: list[int]
     prompt_b_ids: list[int]
     max_new_tokens: int
-    # Exact post-budget user content used to render prompt B. ``None`` means
-    # there was no retrieved memory and B reused prompt A unchanged.
+    # Exact post-budget user content used to render prompt B. ``None`` means B
+    # reused prompt A unchanged instead of rendering a distinct context.
     prompt_b_text: str | None = None
 
 
@@ -398,23 +399,31 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
         prompt_a_ids: Sequence[int],
         memory_context: OPSDMemoryContext,
         max_new_tokens: int,
+        prompt_b_extra_fields: Mapping[str, str] | None = None,
+        force_prompt_b: bool = False,
     ) -> OPSDPromptPair:
         """Build A/B using the caller-specified shared generation length."""
         prompt_a_ids = list(prompt_a_ids)
         prompt_b_text = None
-        if not memory_context.has_memory:
+        if not memory_context.has_memory and not force_prompt_b:
             prompt_b_ids = list(prompt_a_ids)
         else:
             current_prompt_a = self.tokenizer.decode(prompt_a_ids, skip_special_tokens=True)
+            fields = {
+                "prompt_a": current_prompt_a,
+                "memory_prompt": memory_context.memory_prompt,
+                "memory_summary": memory_context.memory_summary,
+                "memory_trajectory": memory_context.memory_trajectory,
+            }
+            prompt_b_extra_fields = dict(prompt_b_extra_fields or {})
+            duplicate_fields = fields.keys() & prompt_b_extra_fields.keys()
+            if duplicate_fields:
+                raise ValueError(f"Prompt B extra fields must not replace built-in fields: {sorted(duplicate_fields)}.")
+            fields.update(prompt_b_extra_fields)
             prompt_b_text, prompt_b_ids = await self._render_prompt_with_budget(
                 template=self.prompt_b_template,
-                fields={
-                    "prompt_a": current_prompt_a,
-                    "memory_prompt": memory_context.memory_prompt,
-                    "memory_summary": memory_context.memory_summary,
-                    "memory_trajectory": memory_context.memory_trajectory,
-                },
-                trim_order=("memory_trajectory", "memory_summary", "memory_prompt"),
+                fields=fields,
+                trim_order=("memory_trajectory", "memory_summary", "memory_prompt", *prompt_b_extra_fields),
                 trim_sides={"memory_prompt": "right"},
                 max_prompt_tokens=self.memory_prompt_max_length,
             )
@@ -432,6 +441,8 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
         memory_context: OPSDMemoryContext,
         sampling_params: dict[str, Any],
         priority: int = 0,
+        prompt_b_extra_fields: Mapping[str, str] | None = None,
+        force_prompt_b: bool = False,
     ) -> OPSDTurnOutput:
         """Construct and submit one native two-member PDS request group."""
         max_new_tokens = sampling_params.get(
@@ -442,6 +453,8 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
             prompt_a_ids=prompt_a_ids,
             memory_context=memory_context,
             max_new_tokens=max_new_tokens,
+            prompt_b_extra_fields=prompt_b_extra_fields,
+            force_prompt_b=force_prompt_b,
         )
         sample_group = f"opsd-{memory_context.request_id}-{uuid4().hex}"
         base_params = dict(sampling_params)
@@ -613,11 +626,18 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
         prompt_a: str,
         trajectory: str,
         priority: int,
+        summary_extra_fields: Mapping[str, str] | None = None,
     ) -> str:
+        fields = {"prompt_a": prompt_a, "trajectory": trajectory}
+        summary_extra_fields = dict(summary_extra_fields or {})
+        duplicate_fields = fields.keys() & summary_extra_fields.keys()
+        if duplicate_fields:
+            raise ValueError(f"Summary extra fields must not replace built-in fields: {sorted(duplicate_fields)}.")
+        fields.update(summary_extra_fields)
         _, summary_prompt_ids = await self._render_prompt_with_budget(
             template=self.summary_template,
-            fields={"prompt_a": prompt_a, "trajectory": trajectory},
-            trim_order=("prompt_a", "trajectory"),
+            fields=fields,
+            trim_order=("prompt_a", "trajectory", *summary_extra_fields),
             max_prompt_tokens=self._context_limit() - 2,
         )
         max_new_tokens = min(

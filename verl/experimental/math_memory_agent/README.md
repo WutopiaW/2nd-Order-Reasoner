@@ -13,19 +13,22 @@ rollouts. It preserves the normal OPSD flow:
 6. return aligned fused targets for both prompt A and prompt B during training.
 
 The dataset must provide an unboxed or boxed scalar answer at
-`reward_model.ground_truth`. The model response must contain a final boxed
-answer that Math-Verify can extract. A response stopped by the generation length
-limit receives a neutral summary that captures useful partial progress without
-calling the answer correct or incorrect. For non-truncated responses, a
+`reward_model.ground_truth` and a non-empty worked reference solution at
+`extra_info.solution`. The model response must contain a final boxed answer that
+Math-Verify can extract. All three outcome-aware summaries compare the generated
+trajectory with the reference solution. A response stopped by the generation
+length limit receives a neutral summary that does not call the answer correct or
+incorrect. For non-truncated responses, a
 missing/malformed answer, verifier error, or verifier timeout is treated as
 incorrect. The verifier still runs for truncated responses so its raw result
 remains available for auditing.
 
 The no-thinking setting applies only to summary generation. Prompt A and prompt
-B keep their configured chat-template behavior. The recipe stores the complete
-trajectory, including Qwen thinking, for auditing. When a record is retrieved to
-construct prompt B, `extract_formal_response()` removes the prior trajectory's
-`<think>...</think>` block so only its concise formal response is reused.
+B keep their configured chat-template behavior. During training, prompt B uses
+the OPSD teacher-style template with the current reference solution, retrieved
+problem, and retrieved summary as privileged context. Validation omits the
+reference solution from prompt B. The recipe stores the complete generated
+trajectory, including Qwen thinking, for auditing.
 
 Each JSONL memory record also contains `trajectory_a` and `trajectory_b` as full
 chat-message lists, plus the normalized verifier `ground_truth`. The assistant
@@ -34,10 +37,9 @@ omitting chat-template control tokens such as `<|im_end|>`. Prompt retrieval use
 the original user-message text. The `Current problem` section of prompt B uses
 the decoded prompt A, intentionally preserving its rendered `user` and
 `assistant` role markers. Prompt B also includes the retrieved record's original
-problem so its summary and formal trajectory remain grounded. When memory is
-used, `trajectory_b` records the exact prompt-B text after token-budget trimming.
-The legacy string `trajectory` field remains available for retrieval and
-backward compatibility.
+problem so its summary remains grounded. When memory is used, `trajectory_b`
+records the exact prompt-B text after token-budget trimming. The legacy string
+`trajectory` field remains available for retrieval and backward compatibility.
 
 Configure the rollout with:
 
@@ -59,10 +61,9 @@ three summary prompts was used. Validation rollouts still run the verifier and
 summary generation, but they do not update global memory. During training, an
 incorrect trajectory returns an all-zero `response_mask`, so it contributes no
 direct distillation gradient; verification, summary generation, and memory
-write-back still run for both outcomes. When a memory was retrieved, each
-correct training rollout produces two distillation samples: one conditioned on
-prompt A and one on prompt B, both supervised by the same fused distribution.
-Prompt B targets are independently aligned to prompt B's token length. If no
-memory was retrieved, prompt B is identical to prompt A and is not duplicated.
-Validation keeps the original response mask and returns only prompt A, because
-it does not perform a training update.
+write-back still run for both outcomes. Each training rollout sends prompt A and
+the privileged prompt B through one paired PDS request and returns both as
+distillation samples supervised by the shared fused distribution. Prompt B's
+targets are independently aligned to its token length, including before memory
+warmup when the reference solution makes B distinct from A. Validation keeps the
+original response mask and returns only prompt A.
