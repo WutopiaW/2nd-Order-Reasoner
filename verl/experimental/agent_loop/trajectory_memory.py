@@ -114,6 +114,7 @@ class TrajectoryRecord:
     trajectory_a: list[dict[str, Any]] | None = None
     trajectory_b: list[dict[str, Any]] | None = None
     ground_truth: str | None = None
+    solution: str | None = None
 
 
 def _copy_message_list(
@@ -163,6 +164,7 @@ class TrajectoryMemory:
             trajectory_a=_copy_message_list(record.trajectory_a, field_name="trajectory_a"),
             trajectory_b=_copy_message_list(record.trajectory_b, field_name="trajectory_b"),
             ground_truth=record.ground_truth,
+            solution=record.solution,
         )
         self._records.pop(record.request_id, None)
         self._records[record.request_id] = normalized_record
@@ -238,7 +240,7 @@ def append_memory_record(path: str | Path, record: TrajectoryRecord, *, memory_s
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(record)
     payload.pop("embedding", None)
-    for optional_field in ("trajectory_a", "trajectory_b", "ground_truth"):
+    for optional_field in ("trajectory_a", "trajectory_b", "ground_truth", "solution"):
         if payload[optional_field] is None:
             payload.pop(optional_field)
     payload["memory_size"] = memory_size
@@ -299,6 +301,9 @@ class TrajectoryMemoryActor:
                                 if payload.get("ground_truth") is not None
                                 else None
                             ),
+                            solution=(
+                                str(payload["solution"]) if payload.get("solution") is not None else None
+                            ),
                         )
                     except (KeyError, TypeError, ValueError) as error:
                         raise ValueError(f"Invalid memory seed record at {seed_file}:{line_number}") from error
@@ -321,6 +326,7 @@ class TrajectoryMemoryActor:
         trajectory_a: list[dict[str, Any]] | None = None,
         trajectory_b: list[dict[str, Any]] | None = None,
         ground_truth: str | None = None,
+        solution: str | None = None,
     ) -> None:
         record = TrajectoryRecord(
             request_id=request_id,
@@ -332,6 +338,7 @@ class TrajectoryMemoryActor:
             trajectory_a=trajectory_a,
             trajectory_b=trajectory_b,
             ground_truth=ground_truth,
+            solution=solution,
         )
         self.memory.upsert(record)
         if self.output_path is not None:

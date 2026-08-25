@@ -18,28 +18,30 @@ The dataset must provide an unboxed or boxed scalar answer at
 Math-Verify can extract. All three outcome-aware summaries compare the generated
 trajectory with the reference solution. A response stopped by the generation
 length limit receives a neutral summary that does not call the answer correct or
-incorrect. For non-truncated responses, a
-missing/malformed answer, verifier error, or verifier timeout is treated as
+incorrect. For non-truncated responses, a missing/malformed answer, verifier
+error, or verifier timeout is treated as
 incorrect. The verifier still runs for truncated responses so its raw result
 remains available for auditing.
 
 The no-thinking setting applies only to summary generation. Prompt A and prompt
 B keep their configured chat-template behavior. During training, prompt B uses
-the OPSD teacher-style template with the current reference solution, retrieved
-problem, and retrieved summary as privileged context. Validation omits the
-reference solution from prompt B. The recipe stores the complete generated
-trajectory, including Qwen thinking, for auditing.
+the OPSD teacher-style template with the retrieved problem, its saved reference
+solution, and its summary as privileged context. The current problem's reference
+solution is never inserted into its own prompt B; it is used only after rollout
+generation for summary comparison and memory write-back. The recipe stores the
+complete generated trajectory, including Qwen thinking, for auditing.
 
 Each JSONL memory record also contains `trajectory_a` and `trajectory_b` as full
-chat-message lists, plus the normalized verifier `ground_truth`. The assistant
-message in both trajectories retains Qwen thinking tags and their contents while
-omitting chat-template control tokens such as `<|im_end|>`. Prompt retrieval uses
-the original user-message text. The `Current problem` section of prompt B uses
-the decoded prompt A, intentionally preserving its rendered `user` and
-`assistant` role markers. Prompt B also includes the retrieved record's original
-problem so its summary remains grounded. When memory is used, `trajectory_b`
-records the exact prompt-B text after token-budget trimming. The legacy string
-`trajectory` field remains available for retrieval and backward compatibility.
+chat-message lists, plus the normalized verifier `ground_truth` and dataset
+`solution`. The assistant message in both trajectories retains Qwen thinking
+tags and their contents while omitting chat-template control tokens such as
+`<|im_end|>`. Prompt retrieval uses the original user-message text. The `Current
+problem` section of prompt B uses the decoded prompt A, intentionally preserving
+its rendered `user` and `assistant` role markers. Prompt B also includes the
+retrieved record's original problem and solution so its summary remains
+grounded. When memory is used, `trajectory_b` records the exact prompt-B text
+after token-budget trimming. The legacy string `trajectory` field remains
+available for retrieval and backward compatibility.
 
 Configure the rollout with:
 
@@ -64,6 +66,6 @@ direct distillation gradient; verification, summary generation, and memory
 write-back still run for both outcomes. Each training rollout sends prompt A and
 the privileged prompt B through one paired PDS request and returns both as
 distillation samples supervised by the shared fused distribution. Prompt B's
-targets are independently aligned to its token length, including before memory
-warmup when the reference solution makes B distinct from A. Validation keeps the
+targets are independently aligned to its token length. Before memory warmup,
+prompt B is identical to prompt A and is not duplicated. Validation keeps the
 original response mask and returns only prompt A.

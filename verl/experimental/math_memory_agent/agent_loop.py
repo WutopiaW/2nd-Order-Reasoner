@@ -32,18 +32,13 @@ from verl.utils.profiler import simple_timer
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
 
 MATH_PROMPT_B_TEMPLATE = r"""You are solving the current math problem. A potentially relevant experience
-summarized from a different problem and a reference solution for the current problem are provided as privileged
-context.
+summarized from a different problem and the reference solution for that retrieved problem are provided as
+privileged context.
 
 Current problem:
 === Current Problem Begin ===
 {prompt_a}
 === Current Problem End ===
-
-Reference solution for the current problem:
-=== Reference Solution Begin ===
-{reference_solution}
-=== Reference Solution End ===
 
 Retrieved related problem:
 === Retrieved Problem Begin ===
@@ -55,6 +50,11 @@ Summary of the retrieved experience:
 {memory_summary}
 === Retrieved Summary End ===
 
+Reference solution for the retrieved problem:
+=== Retrieved Solution Begin ===
+{memory_solution}
+=== Retrieved Solution End ===
+
 Instructions:
 
 1. Determine internally which general strategies or warnings from the retrieved experience apply to the current
@@ -64,11 +64,11 @@ Instructions:
 3. Any statement that the previous attempt was correct, incorrect, or truncated applies only to the retrieved
    problem.
 4. Do not infer or reuse the retrieved problem's final answer.
-5. The reference solution belongs to the current problem. Use it as training-time guidance, but verify its steps
-   and do not merely copy it.
+5. The reference solution belongs only to the retrieved problem. Use it to understand and verify the retrieved
+   experience, but never treat it as the solution or final answer to the current problem.
 6. Solve the current problem independently and completely using your own reasoning.
 7. Explore alternative approaches, check intermediate results, and backtrack or reconsider when necessary.
-8. Do not shorten the solution merely because the retrieved summary or reference solution is concise.
+8. Do not shorten the solution merely because the retrieved summary or solution is concise.
 9. Put the final answer within \boxed{{}}.
 
 Now solve the current problem."""
@@ -294,11 +294,6 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         trajectory_b.append(deepcopy(assistant_message))
         return trajectory_a, trajectory_b
 
-    @staticmethod
-    def _should_distill_prompt_b(prompt_pair: OPSDPromptPair, *, validate: bool) -> bool:
-        """Return B only when it is a distinct training context."""
-        return not validate and prompt_pair.prompt_b_text is not None
-
     async def initialize_memory_context(
         self,
         prompt_a_ids: Sequence[int],
@@ -313,6 +308,12 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         if retrieved is None:
             return OPSDMemoryContext(request_id=request_id, prompt_a_text=prompt_a_text)
         record = retrieved["record"]
+        memory_solution = record.get("solution")
+        if not isinstance(memory_solution, str) or not memory_solution.strip():
+            raise ValueError(
+                "Retrieved math memory must contain a non-empty solution so prompt B can ground the "
+                "historical experience without exposing the current problem's solution."
+            )
         return OPSDMemoryContext(
             request_id=request_id,
             prompt_a_text=prompt_a_text,
@@ -321,6 +322,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
             memory_prompt=record["prompt"],
             memory_summary=str(record["summary"]).strip(),
             memory_trajectory=extract_formal_response(record["trajectory"]),
+            memory_solution=memory_solution.strip(),
         )
 
     async def _summarize(
@@ -385,6 +387,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                     "prompt": memory_context.memory_prompt,
                     "trajectory": memory_context.memory_trajectory,
                     "summary": memory_context.memory_summary,
+                    "solution": memory_context.memory_solution,
                 }
             await self.memory.upsert.remote(
                 request_id=memory_context.request_id,
@@ -394,6 +397,7 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 trajectory_a=trajectory_a,
                 trajectory_b=trajectory_b,
                 ground_truth=ground_truth,
+                solution=reference_solution,
                 metadata={
                     "retrieved_request_id": memory_context.retrieved_request_id,
                     "retrieval_score": memory_context.retrieval_score,
@@ -417,7 +421,6 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
         messages = list(kwargs["raw_prompt"])
         ground_truth = self._ground_truth_from_sample(kwargs)
         reference_solution = self._reference_solution_from_sample(kwargs, required=not __validate__)
-        prompt_b_reference_solution = "" if __validate__ else reference_solution
         multi_modal_data = await self.process_multi_modal_info(messages)
         if multi_modal_data:
             raise NotImplementedError("MathOPSDMemoryAgentLoop currently supports text-only prompts.")
@@ -433,8 +436,6 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
                 memory_context=memory_context,
                 sampling_params=sampling_params,
                 priority=int(priority),
-                prompt_b_extra_fields={"reference_solution": prompt_b_reference_solution},
-                force_prompt_b=bool(prompt_b_reference_solution),
             )
 
         response_limit = int(self.rollout_config.response_length)
@@ -532,10 +533,10 @@ class MathOPSDMemoryAgentLoop(OPSDMemoryAgentLoopBase):
             extra_fields=extra_fields_a,
         )
 
-        # Validation keeps A as the sole output so reward and reporting semantics
-        # remain unchanged. A missing prompt-B text means B reused A exactly, so
-        # returning it again would only double this sample's training weight.
-        if not self._should_distill_prompt_b(turn_output.prompt_pair, validate=__validate__):
+        # With no retrieved memory B is exactly A, so returning it again would
+        # only double this sample's weight. Validation also keeps A as the sole
+        # output so reward and reporting semantics remain unchanged.
+        if __validate__ or not memory_context.has_memory:
             return output_a
 
         accumulator_b = self.new_target_accumulator(turn_output.prompt_pair.prompt_b_ids)

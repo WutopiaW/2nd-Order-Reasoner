@@ -87,6 +87,7 @@ class OPSDMemoryContext:
     memory_prompt: str = ""
     memory_summary: str = ""
     memory_trajectory: str = ""
+    memory_solution: str = ""
 
     @property
     def has_memory(self) -> bool:
@@ -391,6 +392,7 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
             memory_prompt=record["prompt"],
             memory_summary=extract_formal_response(record["summary"]),
             memory_trajectory=extract_formal_response(record["trajectory"]),
+            memory_solution=str(record.get("solution") or "").strip(),
         )
 
     async def initialize_prompt_pair(
@@ -399,13 +401,11 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
         prompt_a_ids: Sequence[int],
         memory_context: OPSDMemoryContext,
         max_new_tokens: int,
-        prompt_b_extra_fields: Mapping[str, str] | None = None,
-        force_prompt_b: bool = False,
     ) -> OPSDPromptPair:
         """Build A/B using the caller-specified shared generation length."""
         prompt_a_ids = list(prompt_a_ids)
         prompt_b_text = None
-        if not memory_context.has_memory and not force_prompt_b:
+        if not memory_context.has_memory:
             prompt_b_ids = list(prompt_a_ids)
         else:
             current_prompt_a = self.tokenizer.decode(prompt_a_ids, skip_special_tokens=True)
@@ -414,16 +414,12 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
                 "memory_prompt": memory_context.memory_prompt,
                 "memory_summary": memory_context.memory_summary,
                 "memory_trajectory": memory_context.memory_trajectory,
+                "memory_solution": memory_context.memory_solution,
             }
-            prompt_b_extra_fields = dict(prompt_b_extra_fields or {})
-            duplicate_fields = fields.keys() & prompt_b_extra_fields.keys()
-            if duplicate_fields:
-                raise ValueError(f"Prompt B extra fields must not replace built-in fields: {sorted(duplicate_fields)}.")
-            fields.update(prompt_b_extra_fields)
             prompt_b_text, prompt_b_ids = await self._render_prompt_with_budget(
                 template=self.prompt_b_template,
                 fields=fields,
-                trim_order=("memory_trajectory", "memory_summary", "memory_prompt", *prompt_b_extra_fields),
+                trim_order=("memory_trajectory", "memory_solution", "memory_summary", "memory_prompt"),
                 trim_sides={"memory_prompt": "right"},
                 max_prompt_tokens=self.memory_prompt_max_length,
             )
@@ -441,8 +437,6 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
         memory_context: OPSDMemoryContext,
         sampling_params: dict[str, Any],
         priority: int = 0,
-        prompt_b_extra_fields: Mapping[str, str] | None = None,
-        force_prompt_b: bool = False,
     ) -> OPSDTurnOutput:
         """Construct and submit one native two-member PDS request group."""
         max_new_tokens = sampling_params.get(
@@ -453,8 +447,6 @@ class OPSDMemoryAgentLoopBase(AgentLoopBase):
             prompt_a_ids=prompt_a_ids,
             memory_context=memory_context,
             max_new_tokens=max_new_tokens,
-            prompt_b_extra_fields=prompt_b_extra_fields,
-            force_prompt_b=force_prompt_b,
         )
         sample_group = f"opsd-{memory_context.request_id}-{uuid4().hex}"
         base_params = dict(sampling_params)

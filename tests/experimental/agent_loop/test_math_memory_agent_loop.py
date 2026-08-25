@@ -76,26 +76,30 @@ def test_math_templates_accept_reference_solution():
     fields = {
         "prompt_a": "problem",
         "trajectory": "attempt",
-        "reference_solution": "reference",
+        "reference_solution": "current-only reference",
         "memory_prompt": "previous problem",
         "memory_summary": "previous summary",
         "memory_trajectory": "previous trajectory",
+        "memory_solution": "retrieved reference",
     }
 
     for template in (SUCCESS_SUMMARY_TEMPLATE, FAILURE_SUMMARY_TEMPLATE, TRUNCATED_SUMMARY_TEMPLATE):
         rendered = template.format(**fields)
-        assert "Reference solution:\nreference" in rendered
+        assert "Reference solution:\ncurrent-only reference" in rendered
     prompt_b = MATH_PROMPT_B_TEMPLATE.format(**fields)
     assert "=== Current Problem Begin ===\nproblem\n=== Current Problem End ===" in prompt_b
-    assert "=== Reference Solution Begin ===\nreference\n=== Reference Solution End ===" in prompt_b
     assert "=== Retrieved Problem Begin ===\nprevious problem\n=== Retrieved Problem End ===" in prompt_b
+    assert "=== Retrieved Solution Begin ===\nretrieved reference\n=== Retrieved Solution End ===" in prompt_b
     assert "=== Retrieved Summary Begin ===\nprevious summary\n=== Retrieved Summary End ===" in prompt_b
+    assert prompt_b.index("=== Retrieved Problem Begin ===") < prompt_b.index("=== Retrieved Summary Begin ===")
+    assert prompt_b.index("=== Retrieved Summary Begin ===") < prompt_b.index("=== Retrieved Solution Begin ===")
+    assert "current-only reference" not in prompt_b
     assert "previous trajectory" not in prompt_b
     assert r"Put the final answer within \boxed{}." in prompt_b
 
 
 @pytest.mark.asyncio
-async def test_prompt_b_can_be_forced_with_reference_solution_before_memory_warmup():
+async def test_prompt_b_uses_only_the_retrieved_problem_solution():
     class WhitespaceTokenizer:
         @staticmethod
         def encode(text, add_special_tokens=False):
@@ -120,27 +124,71 @@ async def test_prompt_b_can_be_forced_with_reference_solution_before_memory_warm
     pair = await OPSDMemoryAgentLoopBase.initialize_prompt_pair(
         loop,
         prompt_a_ids=["current", "problem"],
-        memory_context=OPSDMemoryContext(request_id="request-1", prompt_a_text="current problem"),
+        memory_context=OPSDMemoryContext(
+            request_id="request-1",
+            prompt_a_text="current problem",
+            retrieved_request_id="previous-request",
+            memory_prompt="previous problem",
+            memory_summary="previous lesson",
+            memory_solution="retrieved gold reasoning and answer",
+        ),
         max_new_tokens=32,
-        prompt_b_extra_fields={"reference_solution": "gold reasoning and answer"},
-        force_prompt_b=True,
     )
 
     assert pair.prompt_b_text is not None
-    assert "gold reasoning and answer" in pair.prompt_b_text
+    assert "retrieved gold reasoning and answer" in pair.prompt_b_text
     assert pair.prompt_b_ids != pair.prompt_a_ids
 
 
-def test_solution_conditioned_prompt_b_remains_a_training_sample():
-    prompt_pair = OPSDPromptPair(
-        prompt_a_ids=[1, 2],
-        prompt_b_ids=[3, 4, 5],
-        max_new_tokens=32,
-        prompt_b_text="problem plus reference solution",
+@pytest.mark.asyncio
+async def test_prompt_b_trims_memory_fields_from_least_to_most_important():
+    async def render_prompt_with_budget(**kwargs):
+        assert kwargs["trim_order"] == (
+            "memory_trajectory",
+            "memory_solution",
+            "memory_summary",
+            "memory_prompt",
+        )
+        return "rendered prompt B", [3, 4]
+
+    loop = SimpleNamespace(
+        tokenizer=SimpleNamespace(decode=lambda *args, **kwargs: "current problem"),
+        prompt_b_template=MATH_PROMPT_B_TEMPLATE,
+        memory_prompt_max_length=512,
+        _render_prompt_with_budget=render_prompt_with_budget,
+    )
+    context = OPSDMemoryContext(
+        request_id="request-1",
+        prompt_a_text="current problem",
+        retrieved_request_id="previous-request",
+        memory_prompt="previous problem",
+        memory_summary="previous summary",
+        memory_trajectory="previous trajectory",
+        memory_solution="previous solution",
     )
 
-    assert MathOPSDMemoryAgentLoop._should_distill_prompt_b(prompt_pair, validate=False)
-    assert not MathOPSDMemoryAgentLoop._should_distill_prompt_b(prompt_pair, validate=True)
+    pair = await OPSDMemoryAgentLoopBase.initialize_prompt_pair(
+        loop,
+        prompt_a_ids=[1, 2],
+        memory_context=context,
+        max_new_tokens=32,
+    )
+
+    assert pair.prompt_b_ids == [3, 4]
+
+
+@pytest.mark.asyncio
+async def test_prompt_b_reuses_prompt_a_before_memory_warmup():
+    loop = SimpleNamespace(memory_prompt_max_length=512)
+    pair = await OPSDMemoryAgentLoopBase.initialize_prompt_pair(
+        loop,
+        prompt_a_ids=[1, 2],
+        memory_context=OPSDMemoryContext(request_id="request-1", prompt_a_text="current problem"),
+        max_new_tokens=32,
+    )
+
+    assert pair.prompt_b_ids == pair.prompt_a_ids
+    assert pair.prompt_b_text is None
 
 
 def test_summary_template_depends_on_verifier_outcome():
@@ -298,6 +346,7 @@ async def test_finalize_memory_preserves_raw_trajectory_and_summary():
     assert captured["trajectory_a"][-1]["content"] == "<think>A reasoning</think>\\boxed{1}"
     assert captured["trajectory_b"][-1]["content"] == "<think>B reasoning</think>\\boxed{1}"
     assert captured["ground_truth"] == "1"
+    assert captured["solution"] == "reference reasoning and answer"
     assert captured["metadata"]["math_verifier_score"] == 1.0
     assert captured["metadata"]["math_answer_correct"] is True
     assert captured["metadata"]["math_response_truncated"] is False
@@ -317,6 +366,7 @@ async def test_memory_retrieval_removes_trajectory_thinking_before_prompt_b():
                     "prompt": "previous problem",
                     "trajectory": "<think>previous reasoning</think>\\boxed{2}",
                     "summary": "<think>unexpected summary thinking</think>lesson",
+                    "solution": "previous reference solution",
                 },
             }
 
@@ -330,3 +380,25 @@ async def test_memory_retrieval_removes_trajectory_thinking_before_prompt_b():
 
     assert context.memory_trajectory == "\\boxed{2}"
     assert context.memory_summary == "<think>unexpected summary thinking</think>lesson"
+    assert context.memory_solution == "previous reference solution"
+
+
+@pytest.mark.asyncio
+async def test_math_memory_retrieval_fails_closed_without_solution():
+    class FakeSearch:
+        async def remote(self, *args, **kwargs):
+            return {
+                "score": 0.9,
+                "record": {
+                    "request_id": "previous-request",
+                    "prompt": "previous problem",
+                    "trajectory": "previous trajectory",
+                    "summary": "previous summary",
+                },
+            }
+
+    loop = object.__new__(MathOPSDMemoryAgentLoop)
+    loop.memory = SimpleNamespace(search=FakeSearch())
+
+    with pytest.raises(ValueError, match="non-empty solution"):
+        await loop.initialize_memory_context([1, 2], query_text="current problem")

@@ -99,6 +99,7 @@ def test_memory_state_round_trip_and_dimension_validation():
             trajectory_a=[{"role": "user", "content": "p1"}],
             trajectory_b=[{"role": "user", "content": "memory + p1"}],
             ground_truth="1",
+            solution="worked reference solution",
         )
     )
 
@@ -110,6 +111,7 @@ def test_memory_state_round_trip_and_dimension_validation():
     assert restored.get("r1").trajectory_a == [{"role": "user", "content": "p1"}]
     assert restored.get("r1").trajectory_b == [{"role": "user", "content": "memory + p1"}]
     assert restored.get("r1").ground_truth == "1"
+    assert restored.get("r1").solution == "worked reference solution"
     with pytest.raises(ValueError, match="dimension"):
         restored.search([1.0, 0.0, 0.0])
 
@@ -150,6 +152,7 @@ def test_append_math_memory_record_writes_paired_messages_and_ground_truth(tmp_p
         trajectory_a=[{"role": "user", "content": "What is 1 + 1?"}, assistant],
         trajectory_b=[{"role": "user", "content": "Use memory, then solve."}, assistant],
         ground_truth="2",
+        solution="Add one and one to obtain two.",
     )
 
     append_memory_record(output_path, record, memory_size=1)
@@ -158,6 +161,7 @@ def test_append_math_memory_record_writes_paired_messages_and_ground_truth(tmp_p
     assert saved["trajectory_a"][-1]["content"] == "<think>reasoning</think>\\boxed{2}"
     assert saved["trajectory_b"][0] == {"role": "user", "content": "Use memory, then solve."}
     assert saved["ground_truth"] == "2"
+    assert saved["solution"] == "Add one and one to obtain two."
     assert "embedding" not in saved
 
 
@@ -175,6 +179,7 @@ async def test_retrieved_memory_is_cleaned_before_prompt_b_uses_it():
                     "prompt": "related problem",
                     "trajectory": "<think>old reasoning</think>\nOld final answer",
                     "summary": "<think>summary reasoning</think>\nReusable lesson",
+                    "solution": "Historical worked solution",
                 },
             }
 
@@ -191,6 +196,7 @@ async def test_retrieved_memory_is_cleaned_before_prompt_b_uses_it():
     assert context.memory_prompt == "related problem"
     assert context.memory_trajectory == "Old final answer"
     assert context.memory_summary == "Reusable lesson"
+    assert context.memory_solution == "Historical worked solution"
 
 
 @pytest.mark.asyncio
