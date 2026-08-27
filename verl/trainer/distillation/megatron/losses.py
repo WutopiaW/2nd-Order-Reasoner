@@ -261,6 +261,62 @@ class _VocabParallelKLDivergence(torch.autograd.Function):
         return grad_input, None, None, None
 
 
+class _VocabParallelTopKLogitMSE(torch.autograd.Function):
+    """Raw-logit MSE on global teacher ids without gathering the vocab shards."""
+
+    @staticmethod
+    def forward(ctx, vp_logits, target_topk_logits, target_topk_indices):
+        from megatron.core.parallel_state import (
+            get_tensor_model_parallel_group,
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        from megatron.core.tensor_parallel.utils import VocabUtility
+
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_world_size()
+        partition_vocab_size = vp_logits.size(-1)
+        vocab_start, vocab_end = VocabUtility.vocab_range_from_per_partition_vocab_size(
+            partition_vocab_size, rank, world_size
+        )
+        local_mask = (target_topk_indices >= vocab_start) & (target_topk_indices < vocab_end)
+        local_indices = (target_topk_indices - vocab_start).masked_fill(~local_mask, 0).long()
+        selected = torch.gather(vp_logits.float(), dim=-1, index=local_indices)
+        error = (selected - target_topk_logits.float()) * local_mask
+        topk = target_topk_indices.shape[-1]
+        losses = error.square().sum(dim=-1) / topk
+        abs_error = error.abs().sum(dim=-1) / topk
+        torch.distributed.all_reduce(
+            losses,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_tensor_model_parallel_group(),
+        )
+        torch.distributed.all_reduce(
+            abs_error,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_tensor_model_parallel_group(),
+        )
+        ctx.topk = topk
+        ctx.vocab_size = partition_vocab_size
+        ctx.input_dtype = vp_logits.dtype
+        ctx.save_for_backward(local_indices, local_mask, error)
+        return losses, abs_error
+
+    @staticmethod
+    def backward(ctx, grad_losses, grad_abs_error):
+        del grad_abs_error
+        local_indices, local_mask, error = ctx.saved_tensors
+        grad_input = torch.zeros(
+            (*local_indices.shape[:-1], ctx.vocab_size),
+            device=error.device,
+            dtype=error.dtype,
+        )
+        gradient = 2.0 * error / ctx.topk
+        gradient = gradient * local_mask * grad_losses.unsqueeze(-1)
+        grad_input.scatter_add_(dim=-1, index=local_indices, src=gradient)
+        return grad_input.to(ctx.input_dtype), None, None
+
+
 def compute_forward_kl_topk(
     student_logits: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,
@@ -309,4 +365,33 @@ def compute_forward_kl_topk(
         "teacher_mass": teacher_mass,
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
+    }
+
+
+def compute_topk_logit_mse(
+    student_logits: torch.Tensor,
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Fit raw vocab-parallel logits at the teacher-selected global ids."""
+    del config
+    assert teacher_topk_logits.is_nested and teacher_topk_ids.is_nested
+    if data_format == "thd":
+        teacher_topk_logits, *_ = preprocess_thd_engine(teacher_topk_logits, pre_process=True)
+        teacher_topk_ids, *_ = preprocess_thd_engine(teacher_topk_ids, pre_process=True)
+    else:
+        teacher_topk_logits, *_ = preprocess_bshd_engine(teacher_topk_logits, pre_process=True)
+        teacher_topk_ids, *_ = preprocess_bshd_engine(teacher_topk_ids, pre_process=True)
+    assert teacher_topk_logits.shape == teacher_topk_ids.shape
+    assert teacher_topk_logits.shape[:2] == student_logits.shape[:2]
+    distillation_losses, logit_abs_error = _VocabParallelTopKLogitMSE.apply(
+        student_logits,
+        teacher_topk_logits,
+        teacher_topk_ids,
+    )
+    return {
+        "distillation_losses": distillation_losses,
+        "logit_abs_error": logit_abs_error,
     }

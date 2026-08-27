@@ -72,7 +72,7 @@ class DistillationLossSettings(BaseConfig):
 
     Args:
         names (str | list[str]): Name(s) to register the distillation loss function under.
-        use_topk (bool): Whether the loss function uses top-k log probabilities.
+        use_topk (bool): Whether the loss function uses top-k teacher ids and values.
         use_estimator (bool): Whether the loss function uses single-sample KL estimators.
     """
 
@@ -152,33 +152,45 @@ def compute_topk_loss(
     data: TensorDict,
     student_logits: torch.Tensor,
     data_format: str,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """Compute the topk loss in logit processor.
 
-    Returns:
-    - distillation_losses: (bsz, seqlen/cp_size)
-    - student_mass: (bsz, seqlen/cp_size)
-    - teacher_mass: (bsz, seqlen/cp_size)
+    Returns per-token tensors emitted by the selected backend objective.
     """
+    loss_mode = distillation_config.distillation_loss.loss_mode
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         case "fsdp" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            distillation_loss_fns = {
+                "forward_kl_topk": fsdp_losses.compute_forward_kl_topk,
+                "topk_logit_mse": fsdp_losses.compute_topk_logit_mse,
+            }
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
-            distillation_loss_fn = megatron_losses.compute_forward_kl_topk
+            distillation_loss_fns = {
+                "forward_kl_topk": megatron_losses.compute_forward_kl_topk,
+                "topk_logit_mse": megatron_losses.compute_topk_logit_mse,
+            }
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
 
+    if loss_mode not in distillation_loss_fns:
+        raise NotImplementedError(f"Unsupported top-k distillation loss for {config.strategy=}: {loss_mode!r}")
+    distillation_loss_fn = distillation_loss_fns[loss_mode]
+
+    target_kwargs = {"teacher_topk_ids": data["teacher_ids"]}
+    if loss_mode == "topk_logit_mse":
+        target_kwargs["teacher_topk_logits"] = data["teacher_logits"]
+    else:
+        target_kwargs["teacher_topk_log_probs"] = data["teacher_logprobs"]
     outputs = distillation_loss_fn(
         student_logits=student_logits,
-        teacher_topk_log_probs=data["teacher_logprobs"],
-        teacher_topk_ids=data["teacher_ids"],
         config=distillation_config,
         data_format=data_format,
+        **target_kwargs,
     )
 
     expected_shape = student_logits.shape[:2]
@@ -216,7 +228,7 @@ def distillation_ppo_loss(
         distillation_config: Distillation configuration.
         model_output: Model output, including log_probs, entropy.
         data: Micro input batch, contains
-          - teacher_logprobs: (bsz, seqlen, topk)
+          - teacher_logprobs or teacher_logits: (bsz, seqlen, topk)
           - teacher_ids: (bsz, seqlen, topk)
         student_logits: (bsz, seqlen/cp_size, vocab_size/tp_size).
         data_format: "thd" or "bshd", models not support THD format, e.g GPT-OSS, Qwen3.5
@@ -391,6 +403,33 @@ def compute_forward_kl_topk(
     distillation_losses = distillation_losses.clamp_min(0.0)
 
     return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["topk_logit_mse"], use_topk=True)
+)  # type: ignore[arg-type]
+def compute_topk_logit_mse(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Collect raw-logit MSE emitted by the model's logits processor."""
+    del config, distillation_config
+    distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    logit_abs_error = no_padding_2_padding(model_output["logit_abs_error"], data)
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.bool().to_padded_tensor(False)
+    else:
+        response_mask = response_mask.bool()
+    assert distillation_losses.shape == logit_abs_error.shape == response_mask.shape
+    metric_mask = response_mask if response_mask.any() else torch.ones_like(response_mask)
+    valid_abs_error = logit_abs_error[metric_mask]
+    return distillation_losses, {
+        "distillation/logit_abs_error": valid_abs_error.mean().item(),
+        "distillation/logit_abs_error_max": Metric(AggregationType.MAX, valid_abs_error.max()),
+    }
 
 
 @register_distillation_loss(

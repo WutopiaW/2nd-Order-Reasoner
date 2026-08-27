@@ -147,3 +147,33 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
     }
+
+
+def compute_topk_logit_mse(
+    student_logits: torch.Tensor,
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Fit raw student logits on the token support selected by the teacher."""
+    del config, data_format
+    assert teacher_topk_logits.is_nested and teacher_topk_ids.is_nested
+    teacher_topk_logits = teacher_topk_logits.values().unsqueeze(0)
+    teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0)
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_topk_logits = slice_input_tensor(teacher_topk_logits, dim=1)
+        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+    assert teacher_topk_logits.shape == teacher_topk_ids.shape
+    assert teacher_topk_logits.shape[:2] == student_logits.shape[:2]
+
+    student_selected_logits = torch.gather(
+        student_logits.float(),
+        dim=-1,
+        index=teacher_topk_ids.long(),
+    )
+    logit_error = student_selected_logits - teacher_topk_logits.float()
+    return {
+        "distillation_losses": logit_error.square().mean(dim=-1),
+        "logit_abs_error": logit_error.abs().mean(dim=-1),
+    }

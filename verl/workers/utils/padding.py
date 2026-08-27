@@ -83,21 +83,27 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     # (bsz, seqlen, topk)
     for prefix in ("teacher", "source_topk", "fused_topk"):
         logprobs_key = f"{prefix}_logprobs"
+        logits_key = f"{prefix}_logits"
         ids_key = f"{prefix}_ids"
         topk_logprobs = data.get(logprobs_key, None)
+        topk_logits = data.get(logits_key, None)
+        if topk_logprobs is not None and topk_logits is not None:
+            raise RuntimeError(f"{prefix} cannot contain both logprobs and raw logits.")
+        values_key = logits_key if topk_logits is not None else logprobs_key
+        topk_values = topk_logits if topk_logits is not None else topk_logprobs
         topk_ids = data.get(ids_key, None)
-        if (topk_logprobs is None) != (topk_ids is None):
-            raise RuntimeError(f"{prefix} ids and logprobs must either both be present or both be absent.")
-        if topk_logprobs is None:
+        if (topk_values is None) != (topk_ids is None):
+            raise RuntimeError(f"{prefix} ids and target values must either both be present or both be absent.")
+        if topk_values is None:
             continue
-        topk_logprobs_rmpad = index_first_axis(topk_logprobs.flatten(0, 1), indices)
+        topk_values_rmpad = index_first_axis(topk_values.flatten(0, 1), indices)
         topk_ids_rmpad = index_first_axis(topk_ids.flatten(0, 1), indices)
-        data[logprobs_key] = torch.nested.nested_tensor_from_jagged(
-            topk_logprobs_rmpad.squeeze(-1),
+        data[values_key] = torch.nested.nested_tensor_from_jagged(
+            topk_values_rmpad,
             offsets=cu_seqlens,
         )
         data[ids_key] = torch.nested.nested_tensor_from_jagged(
-            topk_ids_rmpad.squeeze(-1),
+            topk_ids_rmpad,
             offsets=cu_seqlens,
         )
 

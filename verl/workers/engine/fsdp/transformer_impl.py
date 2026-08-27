@@ -1256,7 +1256,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
             data=micro_batch, key="calculate_sum_pi_squared", default=False
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+        distillation_loss_mode = tu.get_non_tensor_data(
+            data=micro_batch,
+            key="distillation_loss_mode",
+            default=None,
+        )
         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
+
+        if use_fused_kernels and distillation_use_topk and distillation_loss_mode == "topk_logit_mse":
+            raise NotImplementedError(
+                f"{distillation_loss_mode} requires the eager logits-processor path; "
+                "the fused top-k kernel does not expose this objective."
+            )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1298,6 +1309,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
                 if isinstance(logits_rmpad, DTensor):
                     logits_rmpad = logits_rmpad.full_tensor()
+                raw_logits_rmpad = logits_rmpad
                 logits_rmpad = logits_rmpad / temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
 
                 log_probs = None
@@ -1321,7 +1333,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
                 if distillation_use_topk:
-                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                    distillation_logits = (
+                        raw_logits_rmpad if distillation_loss_mode == "topk_logit_mse" else logits_rmpad
+                    )
+                    outputs = logits_processor_func(student_logits=distillation_logits.unsqueeze(0), data=micro_batch)
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
                         v = v.squeeze(0)
@@ -1411,6 +1426,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
                 if isinstance(logits, DTensor):
                     logits = logits.full_tensor()
+                raw_logits = logits
                 logits = logits / temperature.clamp(min=1e-8).to(logits.dtype)
 
                 if calculate_entropy:
@@ -1436,7 +1452,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # populated in output_args along the use_remove_padding=True
                     # path of prepare_model_inputs.
                     if distillation_use_topk:
-                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                        if distillation_loss_mode == "topk_logit_mse":
+                            raw_logits_nested = torch.nested.narrow(
+                                raw_logits, 1, starts, seq_lengths, layout=torch.jagged
+                            )
+                            distillation_logits_rmpad = torch.cat([t for t in raw_logits_nested.unbind()])
+                        else:
+                            distillation_logits_rmpad = logits_rmpad
+                        outputs = logits_processor_func(
+                            student_logits=distillation_logits_rmpad.unsqueeze(0),
+                            data=micro_batch,
+                        )
                         for k, v in outputs.items():
                             v = v.squeeze(0)
                             assert v.shape == (logits_rmpad.shape[0],), (

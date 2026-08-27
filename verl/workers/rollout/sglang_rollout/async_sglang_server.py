@@ -50,8 +50,10 @@ from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.logprob_protocol import (
+    PDS_FUSED_TOP_K_LOGITS_FIELD,
     PDS_PROBABILITY_FIELDS,
     extract_pds_probability_fields,
+    extract_pds_topk_logits_fields,
     extract_token_logprobs,
     extract_topk_logprobs,
 )
@@ -75,6 +77,7 @@ class _GenerationRequestContext:
     prompt_logprobs: int | None
     pds_return_prob_trajectory: bool
     pds_top_k: int | None
+    pds_top_k_logits: int | None
 
 
 def _extract_prompt_logprobs_sglang(
@@ -330,7 +333,7 @@ class SGLangHttpServer:
             "attention_backend": attention_backend,
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
             "skip_server_warmup": True,
-            "disable_overlap_scheduler": True,
+            "disable_overlap_schedule": True,
             "quantization": quantization,
             "json_model_override_args": json.dumps({"quantization_config": fp8_block_quant_kwargs})
             if quantization == "fp8"
@@ -592,12 +595,24 @@ class SGLangHttpServer:
         custom_params = sampling_params.get("custom_params")
         pds_return_prob_trajectory = False
         pds_top_k = None
+        pds_top_k_logits = None
         if isinstance(custom_params, dict):
             pds_return_prob_trajectory = bool(custom_params.get("__pds_return_prob_trajectory", False))
             if "__pds_return_top_k" in custom_params:
                 pds_top_k = custom_params["__pds_return_top_k"]
                 if isinstance(pds_top_k, bool) or not isinstance(pds_top_k, int) or pds_top_k <= 0:
                     raise ValueError(f"__pds_return_top_k must be a positive integer, got {pds_top_k!r}.")
+            if "__pds_return_top_k_logits" in custom_params:
+                pds_top_k_logits = custom_params["__pds_return_top_k_logits"]
+                if (
+                    isinstance(pds_top_k_logits, bool)
+                    or not isinstance(pds_top_k_logits, int)
+                    or pds_top_k_logits <= 0
+                ):
+                    raise ValueError(
+                        "__pds_return_top_k_logits must be a positive integer, "
+                        f"got {pds_top_k_logits!r}."
+                    )
 
         request: dict[str, Any] = {
             "rid": request_id,
@@ -639,6 +654,7 @@ class SGLangHttpServer:
             prompt_logprobs=prompt_logprobs,
             pds_return_prob_trajectory=pds_return_prob_trajectory,
             pds_top_k=pds_top_k,
+            pds_top_k_logits=pds_top_k_logits,
         )
         return request, context
 
@@ -650,7 +666,9 @@ class SGLangHttpServer:
         require_pds_fields: bool = True,
     ) -> TokenOutput:
         meta_info = output.get("meta_info", {})
-        has_pds_fields = any(meta_info.get(field) is not None for field in PDS_PROBABILITY_FIELDS)
+        has_pds_fields = any(meta_info.get(field) is not None for field in PDS_PROBABILITY_FIELDS) or (
+            meta_info.get(PDS_FUSED_TOP_K_LOGITS_FIELD) is not None
+        )
         missing_selected_probs = context.pds_return_prob_trajectory and not all(
             meta_info.get(field) is not None
             for field in ("pds_source_token_probs", "pds_fused_token_probs")
@@ -658,10 +676,14 @@ class SGLangHttpServer:
         missing_top_k = context.pds_top_k is not None and not all(
             meta_info.get(field) is not None for field in ("pds_source_top_k", "pds_fused_top_k")
         )
-        if require_pds_fields and (missing_selected_probs or missing_top_k):
+        missing_top_k_logits = (
+            context.pds_top_k_logits is not None
+            and meta_info.get(PDS_FUSED_TOP_K_LOGITS_FIELD) is None
+        )
+        if require_pds_fields and (missing_selected_probs or missing_top_k or missing_top_k_logits):
             raise ValueError(
-                "mix-sglang did not return the requested PDS probability fields. "
-                "Install a build with PDS probability trajectories and top-k support."
+                "mix-sglang did not return the requested PDS target fields. "
+                "Install a build with the requested probability or max-fused top-k logit support."
             )
 
         finish_reason = meta_info.get("finish_reason")
@@ -737,6 +759,13 @@ class SGLangHttpServer:
             extra_fields.update(pds_fields)
             if "fused_log_probs" in pds_fields:
                 log_probs = pds_fields["fused_log_probs"]
+        if context.pds_top_k_logits is not None:
+            topk_logit_fields = extract_pds_topk_logits_fields(
+                meta_info,
+                output_token_ids=token_ids,
+                expected_topk=context.pds_top_k_logits,
+            )
+            extra_fields.update(topk_logit_fields)
         if context.prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,
@@ -810,12 +839,14 @@ class SGLangHttpServer:
             except ValueError:
                 logger.error(
                     "SGLang grouped output conversion failed. group_index=%d, request_id=%r, "
-                    "pds_return_prob_trajectory=%r, pds_top_k=%r, sampling_params=%r, "
+                    "pds_return_prob_trajectory=%r, pds_top_k=%r, pds_top_k_logits=%r, "
+                    "sampling_params=%r, "
                     "raw_group_outputs=%r",
                     group_index,
                     context.request_id,
                     context.pds_return_prob_trajectory,
                     context.pds_top_k,
+                    context.pds_top_k_logits,
                     [request["sampling_params"] for request in request_dicts],
                     outputs,
                 )

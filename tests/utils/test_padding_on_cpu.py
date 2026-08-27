@@ -177,6 +177,31 @@ def test_padding_conversion_preserves_rollout_source_and_fused_topk_distribution
     torch.testing.assert_close(converted["fused_topk_logprobs"][1], (base_logprobs - 200)[1, 2:])
 
 
+def test_padding_conversion_preserves_teacher_raw_logits_with_topk_one():
+    input_ids = torch.tensor([[0, 11, 12], [21, 22, 23]])
+    attention_mask = torch.tensor([[0, 1, 1], [1, 1, 1]])
+    data = TensorDict(
+        {
+            "input_ids": input_ids,
+            "position_ids": torch.arange(3).repeat(2, 1),
+            "attention_mask": attention_mask,
+            "response_mask": attention_mask.clone(),
+            "teacher_ids": torch.tensor([[[0], [4], [5]], [[6], [7], [8]]]),
+            "teacher_logits": torch.tensor([[[0.0], [1.5], [2.5]], [[3.5], [4.5], [5.5]]]),
+        },
+        batch_size=[2],
+    )
+
+    converted = left_right_2_no_padding(data)
+
+    assert converted["teacher_ids"].values().shape == (5, 1)
+    assert converted["teacher_logits"].values().shape == (5, 1)
+    torch.testing.assert_close(
+        converted["teacher_logits"].values().squeeze(-1),
+        torch.tensor([1.5, 2.5, 3.5, 4.5, 5.5]),
+    )
+
+
 def test_padding_roundtrip():
     """Test that converting from padding to nested and back preserves values in the response region"""
     batch_size = 2

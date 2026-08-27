@@ -35,7 +35,7 @@ class DistillationLossConfig(BaseConfig):
     loss_mode (str):
         Distillation loss function to use.
     topk (int, optional):
-        Number of top tokens to consider for top-k distillation losses.
+        Number of teacher-selected tokens to consider for top-k distillation losses.
     use_task_rewards (bool):
         Whether to include task rewards alongside distillation loss.
     distillation_loss_coef (float):
@@ -116,6 +116,9 @@ class DistillationLossConfig(BaseConfig):
                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
                 "should move) is largely unused."
             )
+
+        if self.loss_mode == "topk_logit_mse" and self.use_policy_gradient:
+            raise ValueError("topk_logit_mse requires use_policy_gradient=False for direct logit fitting.")
 
         if not self.use_policy_gradient and self.loss_mode == "k1":
             raise ValueError(
@@ -264,7 +267,8 @@ class DistillationConfig(BaseConfig):
 
     enabled: bool = False
     # "teacher" launches separately configured teacher model(s). "rollout"
-    # consumes teacher_ids/teacher_logprobs produced by the rollout engine.
+    # consumes teacher_ids plus teacher_logprobs or teacher_logits produced by
+    # the rollout engine.
     target_source: str = "teacher"
     n_gpus_per_node: int = 0
     nnodes: int = 0
@@ -284,6 +288,9 @@ class DistillationConfig(BaseConfig):
             # Self-distillation targets share the actor rollout resource pool,
             # so no external teacher configuration or resource pool is needed.
             return
+
+        if self.distillation_loss.loss_mode == "topk_logit_mse":
+            raise ValueError("topk_logit_mse requires distillation.target_source=rollout.")
 
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0

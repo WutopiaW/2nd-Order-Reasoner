@@ -1339,6 +1339,11 @@ class RayPPOTrainer:
             batch_td,
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
+            distillation_loss_mode=(
+                self.distillation_config.distillation_loss.loss_mode
+                if is_distillation_enabled(self.config.get("distillation"))
+                else None
+            ),
             distillation_only=distillation_only,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,

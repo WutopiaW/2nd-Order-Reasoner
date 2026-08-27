@@ -1,0 +1,20 @@
+- name: math_max_logit_agent
+  _target_: verl.experimental.math_max_logit_agent.agent_loop.MathMaxLogitDistillationAgentLoop
+  _recursive_: false
+  target_topk: ${oc.env:OPSD_TARGET_TOPK,32}
+  summary_max_tokens: 256
+  memory_prompt_max_length: ${oc.env:OPSD_MEMORY_PROMPT_MAX_LENGTH,2048}
+  memory_capacity: 100000
+  memory_actor_name: null
+  memory_output_path: ${oc.env:OPSD_MEMORY_OUTPUT,''}
+  memory_seed_path: ${oc.env:OPSD_MEMORY_SEED,''}
+  memory_embedder:
+    _target_: verl.experimental.agent_loop.trajectory_memory.HuggingFaceTextEmbedder
+    model_path: ${oc.env:OPSD_EMBEDDING_MODEL}
+    device: cpu
+    trust_remote_code: false
+    max_length: 512
+  prompt_a_fuse_weight: 1.0
+  prompt_b_fuse_weight: 1.0
+  math_verifier_timeout: 30.0
+  correctness_threshold: 1.0

@@ -18,9 +18,45 @@ import pytest
 
 from verl.workers.rollout.logprob_protocol import (
     extract_pds_probability_fields,
+    extract_pds_topk_logits_fields,
     extract_token_logprobs,
     extract_topk_logprobs,
 )
+
+
+def test_extract_pds_topk_logits_fields_preserves_raw_values_and_teacher_order():
+    fields = extract_pds_topk_logits_fields(
+        {
+            "pds_fused_top_k_logits": [
+                [{"token_id": 7, "logit": 4.5}, {"token_id": 2, "logit": -1.25}],
+                [{"token_id": 3, "logit": 8.0}, {"token_id": 9, "logit": 0.0}],
+            ]
+        },
+        output_token_ids=[7, 3],
+        expected_topk=2,
+    )
+
+    assert fields["fused_topk_ids"] == [[7, 2], [3, 9]]
+    assert fields["fused_topk_logits"] == [[4.5, -1.25], [8.0, 0.0]]
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ([[{"token_id": 1, "logit": float("nan")}]], "finite"),
+        (
+            [[{"token_id": 1, "logit": 2.0}, {"token_id": 1, "logit": 1.0}]],
+            "duplicate",
+        ),
+    ],
+)
+def test_extract_pds_topk_logits_fields_fails_closed(entries, message):
+    with pytest.raises(ValueError, match=message):
+        extract_pds_topk_logits_fields(
+            {"pds_fused_top_k_logits": entries},
+            output_token_ids=[1],
+            expected_topk=len(entries[0]),
+        )
 
 
 def test_extract_token_logprobs_accepts_sglang_entries():

@@ -161,3 +161,40 @@ def test_convert_generate_output_accepts_topk_without_selected_probs():
     assert converted.log_probs is None
     assert converted.extra_fields["source_topk_ids"] == [[7, 8]]
     assert converted.extra_fields["fused_topk_ids"] == [[7, 8]]
+
+
+def test_convert_generate_output_accepts_max_fused_topk_logits():
+    server = object.__new__(SGLangHttpServer)
+    server.config = SimpleNamespace(
+        max_model_len=64,
+        prompt_length=16,
+        response_length=8,
+        enable_rollout_routing_replay=False,
+        mtp=None,
+    )
+    server.model_config = SimpleNamespace(lora_rank=0)
+    server.global_steps = 3
+    _, context = server._prepare_generate_request(
+        prompt_ids=[1, 2],
+        sampling_params={
+            "max_new_tokens": 1,
+            "custom_params": {"__pds_return_top_k_logits": 2},
+        },
+        request_id="request-a",
+    )
+    output = {
+        "output_ids": [7],
+        "meta_info": {
+            "finish_reason": {"type": "stop"},
+            "pds_fused_top_k_logits": [
+                [{"token_id": 7, "logit": 5.0}, {"token_id": 8, "logit": 1.25}]
+            ],
+        },
+    }
+
+    converted = server._convert_generate_output(output, context)
+
+    assert converted.token_ids == [7]
+    assert converted.log_probs is None
+    assert converted.extra_fields["fused_topk_ids"] == [[7, 8]]
+    assert converted.extra_fields["fused_topk_logits"] == [[5.0, 1.25]]

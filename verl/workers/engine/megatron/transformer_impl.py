@@ -920,6 +920,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_sum_pi_squared: bool,
         calculate_entropy: bool,
         distillation_use_topk: bool,
+        distillation_loss_mode: str | None,
         distillation_only: bool,
         logits_processor_func: Callable,
         batch: TensorDict,
@@ -929,8 +930,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
         # avoid non-positive temperature such as padding
         temperature[temperature <= 0] = 1e-8
         assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
-        logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
         ret = {}
+        if distillation_use_topk and distillation_loss_mode == "topk_logit_mse":
+            ret.update(logits_processor_func(student_logits=logits, data=batch, data_format=data_format))
+            # Keep the raw-logit branch's input version intact for its custom
+            # backward; behavior-policy logprobs, when requested, use a
+            # separate temperature-scaled tensor.
+            logits = logits / temperature.unsqueeze(dim=-1).to(logits.dtype)
+        else:
+            logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
         # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy.
         if calculate_sum_pi_squared:
             ret["sum_pi_squared"] = vocab_parallel_sum_pi_squared(logits)
@@ -956,7 +964,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
             logits_bak = logits
 
         # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
-        if distillation_use_topk:
+        if distillation_use_topk and distillation_loss_mode != "topk_logit_mse":
             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
         if not distillation_only:
             ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
@@ -984,7 +992,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+        distillation_loss_mode = tu.get_non_tensor_data(batch, key="distillation_loss_mode", default=None)
         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
+
+        if use_fused_kernels and distillation_use_topk and distillation_loss_mode == "topk_logit_mse":
+            raise NotImplementedError(
+                "topk_logit_mse requires the eager logits-processor path so it can consume raw logits."
+            )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1076,6 +1090,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 calculate_sum_pi_squared=calculate_sum_pi_squared,
                 calculate_entropy=calculate_entropy,
                 distillation_use_topk=distillation_use_topk,
+                distillation_loss_mode=distillation_loss_mode,
                 distillation_only=distillation_only,
                 logits_processor_func=logits_processor_func,
                 batch=batch,

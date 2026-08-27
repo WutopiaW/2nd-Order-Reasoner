@@ -28,6 +28,7 @@ PDS_TOP_K_FIELDS = (
     "pds_fused_top_k",
 )
 PDS_PROBABILITY_FIELDS = PDS_SELECTED_PROBABILITY_FIELDS + PDS_TOP_K_FIELDS
+PDS_FUSED_TOP_K_LOGITS_FIELD = "pds_fused_top_k_logits"
 
 
 def _parse_logprob_entry(entry: Any, *, field_name: str) -> tuple[float, int]:
@@ -153,6 +154,60 @@ def _extract_probability_topk(
         all_logprobs.append(position_logprobs)
         all_token_ids.append(position_token_ids)
     return all_logprobs, all_token_ids
+
+
+def extract_pds_topk_logits_fields(
+    meta_info: dict[str, Any],
+    *,
+    output_token_ids: list[int],
+    expected_topk: int | None,
+) -> dict[str, Any]:
+    """Validate mix-sglang's raw max-fused top-k logit response."""
+    entries = meta_info.get(PDS_FUSED_TOP_K_LOGITS_FIELD)
+    if entries is None:
+        return {}
+    if expected_topk is None or expected_topk <= 0:
+        raise ValueError("mix-sglang PDS top-k logits require a positive expected_topk.")
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+        raise ValueError(f"{PDS_FUSED_TOP_K_LOGITS_FIELD} must be a sequence.")
+    if len(entries) != len(output_token_ids):
+        raise ValueError(
+            f"{PDS_FUSED_TOP_K_LOGITS_FIELD} has {len(entries)} positions, "
+            f"expected {len(output_token_ids)}."
+        )
+
+    all_ids: list[list[int]] = []
+    all_logits: list[list[float]] = []
+    for position, position_entries in enumerate(entries):
+        if not isinstance(position_entries, Sequence) or isinstance(position_entries, (str, bytes)):
+            raise ValueError(f"{PDS_FUSED_TOP_K_LOGITS_FIELD}[{position}] must be a sequence.")
+        if len(position_entries) != expected_topk:
+            raise ValueError(
+                f"{PDS_FUSED_TOP_K_LOGITS_FIELD}[{position}] has top-k width "
+                f"{len(position_entries)}, expected {expected_topk}."
+            )
+        position_ids: list[int] = []
+        position_logits: list[float] = []
+        for rank, entry in enumerate(position_entries):
+            if not isinstance(entry, Mapping) or "token_id" not in entry or "logit" not in entry:
+                raise ValueError(
+                    f"{PDS_FUSED_TOP_K_LOGITS_FIELD}[{position}][{rank}] must contain "
+                    f"token_id and logit, got {entry!r}."
+                )
+            token_id = int(entry["token_id"])
+            logit = float(entry["logit"])
+            if not math.isfinite(logit):
+                raise ValueError(
+                    f"{PDS_FUSED_TOP_K_LOGITS_FIELD}[{position}][{rank}].logit "
+                    f"must be finite, got {logit!r}."
+                )
+            position_ids.append(token_id)
+            position_logits.append(logit)
+        if len(set(position_ids)) != len(position_ids):
+            raise ValueError(f"{PDS_FUSED_TOP_K_LOGITS_FIELD}[{position}] contains duplicate token ids.")
+        all_ids.append(position_ids)
+        all_logits.append(position_logits)
+    return {"fused_topk_ids": all_ids, "fused_topk_logits": all_logits}
 
 
 def extract_pds_probability_fields(

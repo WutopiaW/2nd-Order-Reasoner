@@ -140,21 +140,25 @@ def construct_minimal_padding_template(
     for prefix in ("teacher", "source_topk", "fused_topk"):
         ids_key = f"{prefix}_ids"
         logprobs_key = f"{prefix}_logprobs"
+        logits_key = f"{prefix}_logits"
+        if template_sample.get(logprobs_key) is not None and template_sample.get(logits_key) is not None:
+            raise ValueError(f"{prefix} cannot contain both logprobs and raw logits.")
+        values_key = logits_key if template_sample.get(logits_key) is not None else logprobs_key
         ids = build_padding_topk_tensor(
             template_sample.get(ids_key),
             seq_len=input_ids.size(0),
             fill_value=eos_token_id,
         )
-        logprobs = build_padding_topk_tensor(
-            template_sample.get(logprobs_key),
+        values = build_padding_topk_tensor(
+            template_sample.get(values_key),
             seq_len=input_ids.size(0),
             fill_value=0.0,
         )
-        if (ids is None) != (logprobs is None):
-            raise ValueError(f"{prefix} ids and logprobs must either both be present or both be absent.")
+        if (ids is None) != (values is None):
+            raise ValueError(f"{prefix} ids and target values must either both be present or both be absent.")
         if ids is not None:
             template_sample[ids_key] = ids
-            template_sample[logprobs_key] = logprobs
+            template_sample[values_key] = values
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)

@@ -146,14 +146,17 @@ class AgentLoopOutput(BaseModel):
             rm_scores[-1] = reward_score
             output["rm_scores"] = rm_scores
 
-        teacher_ids, teacher_logprobs = (
+        teacher_ids, teacher_logprobs, teacher_logits = (
             output["extra_fields"].pop("teacher_ids", None),
             output["extra_fields"].pop("teacher_logprobs", None),
+            output["extra_fields"].pop("teacher_logits", None),
         )
         if teacher_ids is not None:
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
             output["teacher_logprobs"] = teacher_logprobs
+        if teacher_logits is not None:
+            output["teacher_logits"] = teacher_logits
         return output
 
 
@@ -180,6 +183,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
+    teacher_logits: Optional[torch.Tensor] = None
+    """Padded raw teacher logits corresponding to ``teacher_ids``."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -842,23 +847,33 @@ class AgentLoopWorker:
             validate=validate,
             sample_kwargs=kwargs,
         )
-        teacher_ids, teacher_logprobs = (
+        teacher_ids, teacher_logprobs, teacher_logits = (
             output.extra_fields.pop("teacher_ids", None),
             output.extra_fields.pop("teacher_logprobs", None),
+            output.extra_fields.pop("teacher_logits", None),
         )
-        if teacher_ids is not None and teacher_logprobs is not None:
+        if teacher_logprobs is not None and teacher_logits is not None:
+            raise RuntimeError("A rollout target cannot provide both teacher_logprobs and teacher_logits.")
+        teacher_values = teacher_logits if teacher_logits is not None else teacher_logprobs
+        if (teacher_ids is None) != (teacher_values is None):
+            raise RuntimeError("teacher_ids and teacher target values must either both be present or both be absent.")
+        if teacher_ids is not None:
             # TODO(wuxibin): remove padding and use tensordict.
             from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
 
-            teacher_ids, teacher_logprobs = _pad_teacher_outputs(
+            teacher_ids, teacher_values = _pad_teacher_outputs(
                 teacher_ids,
-                teacher_logprobs,
+                teacher_values,
                 prompt_width=prompt_output["input_ids"].shape[1],
                 response_width=response_output["input_ids"].shape[1],
                 prompt_length=len(output.prompt_ids),
                 response_length=len(output.response_ids),
                 pad_token_id=self.tokenizer.pad_token_id,
             )
+            if teacher_logits is not None:
+                teacher_logits = teacher_values
+            else:
+                teacher_logprobs = teacher_values
 
         def pad_topk_distribution(
             ids: Optional[torch.Tensor],
@@ -906,6 +921,7 @@ class AgentLoopWorker:
             mm_processor_kwargs=output.mm_processor_kwargs,
             teacher_logprobs=teacher_logprobs,
             teacher_ids=teacher_ids,
+            teacher_logits=teacher_logits,
             source_topk_ids=source_topk_ids,
             source_topk_logprobs=source_topk_logprobs,
             fused_topk_ids=fused_topk_ids,
@@ -1086,8 +1102,10 @@ class AgentLoopWorker:
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
         if getattr(self, "rollout_distillation_enabled", False) and not validate:
+            loss_mode = self.config.distillation.distillation_loss.loss_mode
+            teacher_value_key = "teacher_logits" if loss_mode == "topk_logit_mse" else "teacher_logprobs"
             missing = [
-                key for key in ("teacher_ids", "teacher_logprobs") if output.extra_fields.get(key) is None
+                key for key in ("teacher_ids", teacher_value_key) if output.extra_fields.get(key) is None
             ]
             if missing:
                 raise RuntimeError(
@@ -1116,6 +1134,9 @@ class AgentLoopWorker:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
+            optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if inputs[0].teacher_logits is not None and inputs[0].teacher_ids is not None:
+            optional_outputs["teacher_logits"] = torch.cat([input.teacher_logits for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
         for prefix in ("source_topk", "fused_topk"):
             ids = getattr(inputs[0], f"{prefix}_ids")

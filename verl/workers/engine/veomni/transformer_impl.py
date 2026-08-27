@@ -837,6 +837,13 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
         # prepare_model_outputs().squeeze(0) then lands at (total_nnz,).
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
+        distillation_loss_mode = tu.get_non_tensor_data(
+            data=micro_batch, key="distillation_loss_mode", default=None
+        )
+        if use_fused_kernels and distillation_loss_mode == "topk_logit_mse":
+            raise NotImplementedError(
+                "topk_logit_mse requires VeOmni's eager logits-processor path so it can consume raw logits."
+            )
         if use_fused_kernels and use_remove_padding:
             input_ids_rmpad = model_inputs["input_ids"]
             shift_labels = output_args["input_ids_rmpad_rolled"].unsqueeze(0)

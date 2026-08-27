@@ -74,6 +74,7 @@ def _run_logits_processor(eng, *, distillation_use_topk, distillation_only):
             calculate_sum_pi_squared=False,
             calculate_entropy=False,
             distillation_use_topk=distillation_use_topk,
+            distillation_loss_mode=None,
             distillation_only=distillation_only,
             logits_processor_func=_make_logits_processor(_DISTILLATION_KEYS),
             batch=batch,
@@ -81,6 +82,36 @@ def _run_logits_processor(eng, *, distillation_use_topk, distillation_only):
         )
 
     return mock_log_probs, ret, total_nnz
+
+
+def test_megatron_topk_logit_mse_processor_sees_raw_logits():
+    eng = _make_engine_stub()
+    logits = torch.tensor([[[4.0, 2.0], [6.0, 3.0]]])
+    captured = {}
+
+    def processor(student_logits, data, data_format):
+        del data, data_format
+        captured["student_logits"] = student_logits.detach().clone()
+        return {
+            "distillation_losses": torch.zeros(student_logits.shape[:2]),
+            "logit_abs_error": torch.zeros(student_logits.shape[:2]),
+        }
+
+    eng._lm_head_logits_processor(
+        logits.clone(),
+        torch.tensor([[0, 1]]),
+        torch.full((1, 2), 2.0),
+        calculate_sum_pi_squared=False,
+        calculate_entropy=False,
+        distillation_use_topk=True,
+        distillation_loss_mode="topk_logit_mse",
+        distillation_only=True,
+        logits_processor_func=processor,
+        batch=TensorDict({}, batch_size=[]),
+        data_format="thd",
+    )
+
+    torch.testing.assert_close(captured["student_logits"], logits)
 
 
 @pytest.mark.parametrize("distillation_only", [False, True])
